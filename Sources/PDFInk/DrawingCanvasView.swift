@@ -1,6 +1,33 @@
+
 import AppKit
 import PDFKit
 import PDFInkCore
+import UniformTypeIdentifiers
+
+/// Reads PDF file URLs from Finder drags without relying on pasteboard
+/// content-type filtering, which can reject otherwise valid file URL drags.
+enum PDFDropSupport {
+    static func pdfURL(from sender: NSDraggingInfo) -> URL? {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [
+            .urlReadingFileURLsOnly: true
+        ]
+
+        let urls = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: options
+        ) as? [URL]
+
+        return urls?.first(where: isPDF)
+    }
+
+    static func isPDF(_ url: URL) -> Bool {
+        guard url.isFileURL else { return false }
+        guard let type = UTType(filenameExtension: url.pathExtension) else {
+            return false
+        }
+        return type.conforms(to: .pdf)
+    }
+}
 
 /// Transparent overlay covering the PDFView. Captures pen/mouse/tablet input,
 /// maps it to PDF page space, renders live strokes incrementally, and blits
@@ -14,6 +41,9 @@ final class DrawingCanvasView: NSView {
     weak var pdfView: PDFView?
     let store: StrokeStore
     let toolState: ToolState
+
+    /// Called when a PDF is dropped onto the drawing canvas.
+    var onPDFDropped: ((URL) -> Void)?
 
     // MARK: Live stroke state (page space)
     private var activeSamples: [StrokeSample] = []
@@ -52,6 +82,9 @@ final class DrawingCanvasView: NSView {
         autoresizingMask = [.width, .height]
         wantsLayer = true
 
+        // The canvas overlays PDFView, so it must be a drag destination too.
+        registerForDraggedTypes([.fileURL])
+
         proximityMonitor = NSEvent.addLocalMonitorForEvents(matching: .tabletProximity) { [weak self] event in
             self?.handleProximity(event)
             return event
@@ -70,6 +103,29 @@ final class DrawingCanvasView: NSView {
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
 
+    // MARK: - PDF drag and drop
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        PDFDropSupport.pdfURL(from: sender) != nil ? .copy : []
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        PDFDropSupport.pdfURL(from: sender) != nil ? .copy : []
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        PDFDropSupport.pdfURL(from: sender) != nil
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard let url = PDFDropSupport.pdfURL(from: sender) else {
+            return false
+        }
+
+        onPDFDropped?(url)
+        return true
+    }
+
     /// Called by the owner whenever the stroke store mutates (draw/erase/undo).
     func storeDidChange(pageIndex: Int) {
         invalidateCache(forPage: pageIndex)
@@ -85,6 +141,7 @@ final class DrawingCanvasView: NSView {
     /// Called by the owner when the active tool/color/width changes.
     func toolStateDidChange() {
         window?.invalidateCursorRects(for: self)
+        activeCursor.set()
     }
 
     // MARK: - PDFView observation
@@ -249,6 +306,7 @@ final class DrawingCanvasView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        activeCursor.set()
         guard pdfView?.document != nil else { return }
         let viewPoint = viewPoint(for: event)
         guard let (page, pageIndex) = page(at: viewPoint) else { return }
@@ -270,6 +328,7 @@ final class DrawingCanvasView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        activeCursor.set()
         let viewPoint = viewPoint(for: event)
         let effectiveTool = stylusIsEraserEnd ? .eraser : toolState.tool
 
@@ -299,6 +358,10 @@ final class DrawingCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        activeCursor.set()
+        Self.circleCursor.set()
+        window?.invalidateCursorRects(for: self)
+
         defer {
             activeSamples = []
             activePage = nil
@@ -424,15 +487,64 @@ final class DrawingCanvasView: NSView {
         }
     }
 
+    /// Small circle cursor used for drawing tools (pen, highlighter, eraser).
+    private static let circleCursor: NSCursor = {
+        let size: CGFloat = 16
+        let image = NSImage(size: NSSize(width: size, height: size))
+        image.lockFocus()
+        let path = NSBezierPath(ovalIn: NSRect(x: size * 0.25, y: size * 0.25,
+                                               width: size * 0.5, height: size * 0.5))
+        NSColor.black.setStroke()
+        path.lineWidth = 1
+        path.stroke()
+        image.unlockFocus()
+        return NSCursor(image: image,
+                        hotSpot: NSPoint(x: size / 2, y: size / 2))
+    }()
+
     // MARK: - Cursor
 
-    override func resetCursorRects() {
-        let cursor: NSCursor
-        switch toolState.tool {
-        case .eraser: cursor = .disappearingItem
-        case .lasso: cursor = .pointingHand
-        default: cursor = .crosshair
+    private var trackingArea: NSTrackingArea?
+
+    /// Circle cursor: white outer ring + dark inner ring so it's visible on any background.
+    private static let circleCursor: NSCursor = {
+        let size: CGFloat = 16
+        let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            let r = rect.insetBy(dx: 2.5, dy: 2.5)
+            let outer = NSBezierPath(ovalIn: r)
+            outer.lineWidth = 3
+            NSColor.white.withAlphaComponent(0.9).setStroke()
+            outer.stroke()
+            let inner = NSBezierPath(ovalIn: r)
+            inner.lineWidth = 1.2
+            NSColor.black.setStroke()
+            inner.stroke()
+            return true
         }
-        addCursorRect(bounds, cursor: cursor)
+        return NSCursor(image: image, hotSpot: NSPoint(x: size / 2, y: size / 2))
+    }()
+
+    private var activeCursor: NSCursor {
+        // Keep the eraser distinct; everything else (including lasso) uses the circle.
+        toolState.tool == .eraser ? .disappearingItem : Self.circleCursor
     }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds,
+                                  options: [.cursorUpdate, .mouseMoved, .mouseEnteredAndExited,
+                                            .activeInKeyWindow, .inVisibleRect],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: activeCursor)
+    }
+
+    override func cursorUpdate(with event: NSEvent) { activeCursor.set() }
+    override func mouseMoved(with event: NSEvent)   { activeCursor.set() }
+    override func mouseEntered(with event: NSEvent) { activeCursor.set() }
 }

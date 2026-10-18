@@ -373,6 +373,100 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         saveDocumentAction(nil)
     }
 
+    @objc func addMultiplePagesAction(_ sender: Any?) {
+        guard let document = pdfView.document else { return }
+        let template = whiteboardTemplate ?? .blank
+
+        let defaultSize = (pdfView.currentPage ?? document.page(at: document.pageCount - 1))?
+            .bounds(for: pdfView.displayBox).size ?? WhiteboardTemplate.pageSize
+
+        let (count, pageSize): (Int, CGSize)
+        if sender != nil {
+            guard let chosen = promptForPageCountAndSize(defaultSize: defaultSize) else { return }
+            count = chosen.count
+            pageSize = chosen.size
+        } else {
+            count = 1
+            pageSize = defaultSize
+        }
+
+        guard count > 0 else { return }
+        addPages(count: count, size: pageSize, template: template)
+    }
+
+    private func addPages(count: Int, size: CGSize, template: WhiteboardTemplate) {
+        guard let document = pdfView.document else { return }
+
+        var lastPage: PDFPage?
+        for _ in 0..<count {
+            guard let page = template.makePage(size: size) else { break }
+            document.insert(page, at: document.pageCount)
+            lastPage = page
+        }
+        pdfView.layoutDocumentView()
+        window?.isDocumentEdited = true
+        if let lastPage {
+            let top = CGPoint(x: 0, y: lastPage.bounds(for: pdfView.displayBox).maxY)
+            pdfView.go(to: PDFDestination(page: lastPage, at: top))
+        }
+        let finalPageCount = document.pageCount
+        NSLog("PDFInk: added %d %@ pages (%.0fx%.0f pt), document now has %d pages",
+              count, template.rawValue, size.width, size.height, finalPageCount)
+        saveDocumentAction(nil)
+    }
+
+    private func promptForPageCountAndSize(defaultSize: CGSize) -> (count: Int, size: CGSize)? {
+        let alert = NSAlert()
+        alert.messageText = "Add Multiple Pages"
+        alert.informativeText = "Enter how many pages to add and their size (in points; 72 pt = 1 inch)."
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+
+        let countField = NSTextField(string: "1")
+        let widthField = NSTextField(string: String(format: "%g", defaultSize.width))
+        let heightField = NSTextField(string: String(format: "%g", defaultSize.height))
+        for field in [countField, widthField, heightField] {
+            field.alignment = .right
+            field.widthAnchor.constraint(equalToConstant: 64).isActive = true
+        }
+
+        func row(_ title: String, _ field: NSTextField, _ unit: String) -> NSStackView {
+            let label = NSTextField(labelWithString: title)
+            label.alignment = .right
+            label.widthAnchor.constraint(equalToConstant: 52).isActive = true
+            let unitField = NSTextField(labelWithString: unit)
+            let stack = NSStackView(views: [label, field, unitField])
+            stack.orientation = .horizontal
+            stack.spacing = 6
+            return stack
+        }
+
+        let stack = NSStackView(views: [
+            row("Count", countField, "pages"),
+            row("Width", widthField, "pt"),
+            row("Height", heightField, "pt"),
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.frame = NSRect(x: 0, y: 0, width: 210, height: 90)
+        alert.accessoryView = stack
+        alert.window.initialFirstResponder = countField
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+
+        let count = Int(countField.stringValue.trimmingCharacters(in: .whitespaces))
+        let width = Double(widthField.stringValue.trimmingCharacters(in: .whitespaces))
+        let height = Double(heightField.stringValue.trimmingCharacters(in: .whitespaces))
+        guard let count, count > 0, count <= 1000,
+              let width, let height, width > 0, height > 0 else {
+            presentError(message: "Invalid input",
+                         info: "Count must be 1–1000 and width/height must be positive numbers (in points).")
+            return nil
+        }
+        return (count, CGSize(width: min(width, 20000), height: min(height, 20000)))
+    }
+
     /// Prompts for a new page's width/height in PDF points. Returns nil on cancel.
     private func promptForPageSize(defaultSize: CGSize) -> CGSize? {
         let alert = NSAlert()
@@ -667,7 +761,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         let docSelectors: Set<Selector> = [
             #selector(saveDocumentAction(_:)), #selector(exportFlattenedAction(_:)),
             #selector(zoomInAction(_:)), #selector(zoomOutAction(_:)), #selector(actualSizeAction(_:)),
-            #selector(addPageAction(_:)), #selector(deletePageAction(_:)),
+            #selector(addPageAction(_:)), #selector(addMultiplePagesAction(_:)), #selector(deletePageAction(_:)),
         ]
         if let sel = aSelector, docSelectors.contains(sel), pdfView.document == nil {
             return false

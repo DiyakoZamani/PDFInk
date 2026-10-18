@@ -130,6 +130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                            action: #selector(MainWindowController.addPageAction(_:)),
                                            keyEquivalent: "n")
         addPageItem.keyEquivalentModifierMask = [.command, .shift]
+        fileMenu.addItem(withTitle: "Add Multiple Pages…",
+                         action: #selector(MainWindowController.addMultiplePagesAction(_:)),
+                         keyEquivalent: "")
         fileMenu.addItem(withTitle: "Delete Page",
                          action: #selector(MainWindowController.deletePageAction(_:)),
                          keyEquivalent: "")
