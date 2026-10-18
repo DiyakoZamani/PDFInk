@@ -106,7 +106,8 @@ final class DrawingCanvasView: NSView {
             return event
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
-            self?.handleSpaceKey(event) ?? event
+            guard let self else { return event }
+            return self.handleSpaceKey(event)   // nil = swallow, so PDFView never sees Space
         }
         // If the window loses focus while Space is held, the key-up never arrives.
         notificationTokens.append(NotificationCenter.default.addObserver(
