@@ -55,6 +55,12 @@ final class DrawingCanvasView: NSView {
     private var stylusIsEraserEnd = false
     private var proximityMonitor: Any?
 
+    // Hand tool (hold Space)
+    private var spaceHeld = false
+    private var isPanning = false
+    private var lastPanWindowPoint: CGPoint = .zero
+    private var keyMonitor: Any?
+
     // MARK: Committed-stroke bitmap caches, one per page
     private final class PageCache {
         let context: CGContext
@@ -99,6 +105,16 @@ final class DrawingCanvasView: NSView {
             }
             return event
         }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
+            self?.handleSpaceKey(event) ?? event
+        }
+        // If the window loses focus while Space is held, the key-up never arrives.
+        notificationTokens.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self, (note.object as? NSWindow) === self.window, self.spaceHeld else { return }
+            self.isPanning = false
+            self.setSpaceHeld(false)
+        })
     }
 
     @available(*, unavailable)
@@ -108,6 +124,7 @@ final class DrawingCanvasView: NSView {
         if let proximityMonitor { NSEvent.removeMonitor(proximityMonitor) }
         if let cursorMonitor { NSEvent.removeMonitor(cursorMonitor) }
         notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
     }
 
     override var isFlipped: Bool { false }
@@ -316,6 +333,12 @@ final class DrawingCanvasView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if spaceHeld {                                   // NEW
+            isPanning = true                             // NEW
+            lastPanWindowPoint = convert(viewPoint(for: event), to: nil)   // NEW
+            activeCursor.set()                           // NEW
+            return                                       // NEW
+        }                                                // NEW
         reassertCursor()
         guard pdfView?.document != nil else { return }
         let viewPoint = viewPoint(for: event)
@@ -338,6 +361,7 @@ final class DrawingCanvasView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if isPanning { pan(with: event); return }        // NEW
         reassertCursor()
         let viewPoint = viewPoint(for: event)
         let effectiveTool = stylusIsEraserEnd ? .eraser : toolState.tool
@@ -359,15 +383,17 @@ final class DrawingCanvasView: NSView {
         activeSamples.append(StrokeSample(point: pagePoint, pressure: pressure(for: event)))
         logTiltIfTablet(event)
 
-        // Incremental redraw: only the region around the newest segments.
-        // Catmull-Rom control points of the previous segment shift when a new
-        // point arrives, so invalidate the last few sample positions.
         lastSampleViewPoints.append(viewPoint)
         if lastSampleViewPoints.count > 5 { lastSampleViewPoints.removeFirst() }
         setNeedsDisplay(invalidationRect(around: lastSampleViewPoints))
     }
 
     override func mouseUp(with event: NSEvent) {
+        if isPanning {                                   // NEW
+            isPanning = false                            // NEW
+            reassertCursor()                             // NEW
+            return                                       // NEW
+        }                                                // NEW
         reassertCursor()
 
         defer {
@@ -495,6 +521,54 @@ final class DrawingCanvasView: NSView {
         }
     }
 
+    // MARK: - Hand tool (hold Space to pan)
+
+    /// Returns nil to swallow the event so PDFView never does its "page down" on Space.
+    private func handleSpaceKey(_ event: NSEvent) -> NSEvent? {
+        guard event.keyCode == 49 else { return event }          // 49 = Space
+
+        if event.type == .keyUp {
+            guard spaceHeld else { return event }
+            setSpaceHeld(false)
+            return nil
+        }
+
+        if spaceHeld { return nil }                              // swallow key auto-repeat
+        guard let window, window.isKeyWindow, event.window === window,
+              !(window.firstResponder is NSTextView),            // typing in the hex/page-size fields
+              event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+              pdfView?.document != nil,
+              activePage == nil                                  // don't interrupt a stroke
+        else { return event }
+
+        setSpaceHeld(true)
+        return nil
+    }
+
+    private func setSpaceHeld(_ held: Bool) {
+        spaceHeld = held
+        window?.invalidateCursorRects(for: self)
+        if let window, bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil)) {
+            activeCursor.set()
+        }
+    }
+
+    private func pan(with event: NSEvent) {
+        guard let pdfView, let scrollView = Self.findScrollView(in: pdfView) else { return }
+        let clip = scrollView.contentView
+        let current = convert(viewPoint(for: event), to: nil)     // window coordinates (don't scroll)
+        let before = clip.convert(lastPanWindowPoint, from: nil)
+        let after = clip.convert(current, from: nil)
+        lastPanWindowPoint = current
+
+        var origin = clip.bounds.origin
+        origin.x -= (after.x - before.x)                          // content follows the pen
+        origin.y -= (after.y - before.y)
+        let target = clip.constrainBoundsRect(NSRect(origin: origin, size: clip.bounds.size)).origin
+        clip.scroll(to: target)
+        scrollView.reflectScrolledClipView(clip)
+    }
+
     // MARK: - Cursor
 
     private var trackingArea: NSTrackingArea?
@@ -525,8 +599,8 @@ final class DrawingCanvasView: NSView {
     }()
 
     private var activeCursor: NSCursor {
-        // Keep the eraser distinct; everything else (including lasso) uses the circle.
-        toolState.tool == .eraser ? .disappearingItem : Self.circleCursor
+        if spaceHeld { return isPanning ? .closedHand : .openHand }
+        return toolState.tool == .eraser ? .disappearingItem : Self.circleCursor
     }
 
     override func updateTrackingAreas() {
