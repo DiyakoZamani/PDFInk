@@ -1,4 +1,3 @@
-
 import AppKit
 import PDFKit
 import PDFInkCore
@@ -90,6 +89,16 @@ final class DrawingCanvasView: NSView {
             return event
         }
         observePDFViewChanges()
+        cursorMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .mouseMoved]
+        ) { [weak self] event in
+            guard let self, event.window === self.window else { return event }
+            let p = self.convert(event.locationInWindow, from: nil)
+            if self.bounds.contains(p) {
+                DispatchQueue.main.async { [weak self] in self?.activeCursor.set() }
+            }
+            return event
+        }
     }
 
     @available(*, unavailable)
@@ -97,6 +106,7 @@ final class DrawingCanvasView: NSView {
 
     deinit {
         if let proximityMonitor { NSEvent.removeMonitor(proximityMonitor) }
+        if let cursorMonitor { NSEvent.removeMonitor(cursorMonitor) }
         notificationTokens.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
@@ -306,7 +316,7 @@ final class DrawingCanvasView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        activeCursor.set()
+        reassertCursor()
         guard pdfView?.document != nil else { return }
         let viewPoint = viewPoint(for: event)
         guard let (page, pageIndex) = page(at: viewPoint) else { return }
@@ -328,7 +338,7 @@ final class DrawingCanvasView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        activeCursor.set()
+        reassertCursor()
         let viewPoint = viewPoint(for: event)
         let effectiveTool = stylusIsEraserEnd ? .eraser : toolState.tool
 
@@ -358,9 +368,7 @@ final class DrawingCanvasView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        activeCursor.set()
-        Self.circleCursor.set()
-        window?.invalidateCursorRects(for: self)
+        reassertCursor()
 
         defer {
             activeSamples = []
@@ -487,24 +495,16 @@ final class DrawingCanvasView: NSView {
         }
     }
 
-    /// Small circle cursor used for drawing tools (pen, highlighter, eraser).
-    private static let circleCursor: NSCursor = {
-        let size: CGFloat = 16
-        let image = NSImage(size: NSSize(width: size, height: size))
-        image.lockFocus()
-        let path = NSBezierPath(ovalIn: NSRect(x: size * 0.25, y: size * 0.25,
-                                               width: size * 0.5, height: size * 0.5))
-        NSColor.black.setStroke()
-        path.lineWidth = 1
-        path.stroke()
-        image.unlockFocus()
-        return NSCursor(image: image,
-                        hotSpot: NSPoint(x: size / 2, y: size / 2))
-    }()
-
     // MARK: - Cursor
 
     private var trackingArea: NSTrackingArea?
+    private var cursorMonitor: Any?
+
+    /// Set now, and again after AppKit/PDFKit finish handling this event.
+    private func reassertCursor() {
+        activeCursor.set()
+        DispatchQueue.main.async { [weak self] in self?.activeCursor.set() }
+    }
 
     /// Circle cursor: white outer ring + dark inner ring so it's visible on any background.
     private static let circleCursor: NSCursor = {

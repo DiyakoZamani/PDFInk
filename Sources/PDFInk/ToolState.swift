@@ -44,11 +44,11 @@ final class ToolState {
     }
 
     var nsColor: NSColor {
-        NSColor(calibratedRed: color.red, green: color.green, blue: color.blue, alpha: color.alpha)
+        NSColor(srgbRed: color.red, green: color.green, blue: color.blue, alpha: color.alpha)
     }
 
     func setColor(from nsColor: NSColor) {
-        guard let rgb = nsColor.usingColorSpace(.deviceRGB) else { return }
+        guard let rgb = nsColor.usingColorSpace(.sRGB) else { return }
         color = StrokeColor(red: rgb.redComponent, green: rgb.greenComponent,
                             blue: rgb.blueComponent, alpha: 1.0)
     }

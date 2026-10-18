@@ -3,7 +3,7 @@ import PDFKit
 import PDFInkCore
 import UniformTypeIdentifiers
 
-final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate {
+final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuItemValidation, NSToolbarDelegate, NSTextFieldDelegate {
 
     let pdfView = PDFView()
     let thumbnailView = PageSidebarView()
@@ -19,7 +19,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
 
     private var toolSegment: NSSegmentedControl?
     private var widthSegment: NSSegmentedControl?
-    private var colorPopUp: NSPopUpButton?
+    private var swatchBar: ColorSwatchBar?
+    private var colorPanelObserver: NSObjectProtocol?
+    private var editingSlot: Int?
+    private let palette = ColorPalette()
 
     private(set) var fileURL: URL?
     /// Template used when this document was created as a whiteboard; Add Page
@@ -39,6 +42,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         window.delegate = self
         setUpContentView()
         setUpToolbar()
+        toolState.color = palette.colors[palette.activeSlot]
 
         store.onChange = { [weak self] pageIndex in
             guard let self else { return }
@@ -148,24 +152,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     }
 
     fileprivate func makeColorItem() -> NSToolbarItem {
-        let popUp = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 60, height: 24), pullsDown: false)
-        for (index, preset) in ToolState.presetColors.enumerated() {
-            let menuItem = NSMenuItem(title: preset.name, action: nil, keyEquivalent: "")
-            menuItem.image = Self.swatchImage(for: preset.color)
-            menuItem.tag = index
-            popUp.menu?.addItem(menuItem)
+        let bar = ColorSwatchBar()
+        bar.reload(from: palette)
+        bar.onSelect = { [weak self] slot in
+            guard let self else { return }
+            self.selectColorSlot(slot)
+            // If the editor is open, make it follow the newly selected swatch.
+            if self.editingSlot != nil { self.openEditor(forSlot: slot) }
         }
-        popUp.menu?.addItem(.separator())
-        let custom = NSMenuItem(title: "Custom…", action: nil, keyEquivalent: "")
-        custom.tag = -1
-        popUp.menu?.addItem(custom)
-        popUp.target = self
-        popUp.action = #selector(colorChanged(_:))
-        colorPopUp = popUp
+        bar.onEdit = { [weak self] slot in
+            guard let self else { return }
+            self.selectColorSlot(slot)
+            self.openEditor(forSlot: slot)
+        }
+        swatchBar = bar
         let item = NSToolbarItem(itemIdentifier: ToolbarID.color)
         item.label = "Color"
-        item.view = popUp
+        item.view = bar
         return item
+    }
+
+    private func selectColorSlot(_ slot: Int) {
+        palette.select(slot: slot)
+        toolState.color = palette.colors[palette.activeSlot]
+        swatchBar?.reload(from: palette)
     }
 
     fileprivate func makeWidthItem() -> NSToolbarItem {
@@ -182,16 +192,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         return item
     }
 
-    private static func swatchImage(for color: StrokeColor) -> NSImage {
-        NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
-            let path = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
-            NSColor(calibratedRed: color.red, green: color.green, blue: color.blue, alpha: 1).setFill()
-            path.fill()
-            NSColor.tertiaryLabelColor.setStroke()
-            path.stroke()
-            return true
-        }
-    }
+
 
     private func syncToolbarSelection() {
         let toolIndex: Int
@@ -202,6 +203,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         case .lasso: toolIndex = 3
         }
         toolSegment?.selectedSegment = toolIndex
+        swatchBar?.reload(from: palette)
     }
 
     @objc private func toolSegmentChanged(_ sender: NSSegmentedControl) {
@@ -210,27 +212,95 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         toolState.tool = tools[sender.selectedSegment]
     }
 
-    @objc private func colorChanged(_ sender: NSPopUpButton) {
-        guard let selected = sender.selectedItem else { return }
-        if selected.tag == -1 {
-            let panel = NSColorPanel.shared
-            panel.setTarget(self)
-            panel.setAction(#selector(customColorPicked(_:)))
-            panel.orderFront(nil)
-        } else if (0..<ToolState.presetColors.count).contains(selected.tag) {
-            toolState.color = ToolState.presetColors[selected.tag].color
-        }
-    }
 
-    @objc private func customColorPicked(_ sender: NSColorPanel) {
-        toolState.setColor(from: sender.color)
-    }
 
     @objc private func widthChanged(_ sender: NSSegmentedControl) {
         guard (0..<ToolState.widthPresets.count).contains(sender.selectedSegment) else { return }
         toolState.baseWidth = ToolState.widthPresets[sender.selectedSegment].width
     }
 
+
+    // MARK: - Color palette editor
+
+    private func openEditor(forSlot slot: Int) {
+        guard palette.colors.indices.contains(slot) else { return }
+        editingSlot = slot
+        let panel = NSColorPanel.shared
+        panel.showsAlpha = false
+        panel.mode = .wheel
+        let c = palette.colors[slot]
+        panel.color = NSColor(srgbRed: c.red, green: c.green, blue: c.blue, alpha: 1)
+        panel.setTarget(self)
+        panel.setAction(#selector(panelColorChanged(_:)))
+        installHexAccessory(on: panel, for: c)
+
+        if let obs = colorPanelObserver { NotificationCenter.default.removeObserver(obs) }
+        colorPanelObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: panel, queue: .main) { [weak self] _ in
+            self?.clearColorPanelTarget()
+        }
+        panel.orderFront(nil)
+    }
+
+    private func installHexAccessory(on panel: NSColorPanel, for color: StrokeColor) {
+        let label = NSTextField(labelWithString: "Hex")
+        let field = NSTextField(string: color.hexString)
+        field.tag = 9999
+        field.delegate = self
+        field.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        field.placeholderString = "#RRGGBB"
+        field.widthAnchor.constraint(equalToConstant: 90).isActive = true
+
+        let stack = NSStackView(views: [label, field])
+        stack.orientation = .horizontal
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        stack.frame = NSRect(x: 0, y: 0, width: 160, height: 30)
+        panel.accessoryView = stack
+    }
+
+    private func updateHexField(to color: StrokeColor) {
+        guard let stack = NSColorPanel.shared.accessoryView as? NSStackView else { return }
+        for case let field as NSTextField in stack.arrangedSubviews where field.tag == 9999 {
+            field.stringValue = color.hexString
+        }
+    }
+
+    @objc private func panelColorChanged(_ sender: NSColorPanel) {
+        guard let slot = editingSlot,
+              let rgb = sender.color.usingColorSpace(.sRGB) else { return }
+        let c = StrokeColor(red: rgb.redComponent, green: rgb.greenComponent,
+                            blue: rgb.blueComponent, alpha: 1)
+        palette.setColor(c, at: slot)
+        if slot == palette.activeSlot { toolState.color = c }
+        updateHexField(to: c)
+        swatchBar?.reload(from: palette)
+    }
+
+    private func clearColorPanelTarget() {
+        let panel = NSColorPanel.shared
+        panel.setTarget(nil)
+        panel.setAction(nil)
+        panel.accessoryView = nil
+        if let obs = colorPanelObserver {
+            NotificationCenter.default.removeObserver(obs)
+            colorPanelObserver = nil
+        }
+        editingSlot = nil
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, field.tag == 9999,
+              let slot = editingSlot else { return }
+        guard let c = StrokeColor.from(hex: field.stringValue) else {
+            NSSound.beep()
+            field.stringValue = palette.colors[slot].hexString
+            return
+        }
+        let panel = NSColorPanel.shared
+        panel.color = NSColor(srgbRed: c.red, green: c.green, blue: c.blue, alpha: 1)
+        panelColorChanged(panel)
+    }
     // MARK: - Document handling
 
     func openPDF(at url: URL) {

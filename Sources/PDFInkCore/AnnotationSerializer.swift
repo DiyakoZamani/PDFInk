@@ -20,18 +20,17 @@ public enum AnnotationSerializer {
         annotation.userName = annotationTitle
 
         // PDFAnnotation paths are relative to the annotation's bounds origin.
-        let path = NSBezierPath()
+        // PDFAnnotation paths are relative to the annotation's bounds origin.
         let cgPath = StrokeGeometry.smoothedPath(stroke.samples)
         var transform = CGAffineTransform(translationX: -bounds.origin.x, y: -bounds.origin.y)
         if let shifted = cgPath.copy(using: &transform) {
-            path.append(NSBezierPath(cgPath: shifted))
+            annotation.add(bezierPath(from: shifted))
         }
-        annotation.add(path)
 
         // Alpha goes into the color itself: PDFKit writes it as /CA on save,
         // and unlike a manually-set /CA key it also honors it when rendering.
         let alpha: CGFloat = stroke.tool == .highlighter ? 0.4 : stroke.color.alpha
-        annotation.color = NSColor(calibratedRed: stroke.color.red,
+        annotation.color = NSColor(srgbRed: stroke.color.red,
                                    green: stroke.color.green,
                                    blue: stroke.color.blue,
                                    alpha: alpha)
@@ -51,6 +50,35 @@ public enum AnnotationSerializer {
                                 forAnnotationKey: PDFAnnotationKey(rawValue: strokePayloadKey))
         }
         return annotation
+    }
+
+    /// CGPath -> NSBezierPath without NSBezierPath(cgPath:) (macOS 14+ only).
+    private static func bezierPath(from cgPath: CGPath) -> NSBezierPath {
+        let path = NSBezierPath()
+        cgPath.applyWithBlock { pointer in
+            let e = pointer.pointee
+            let p = e.points
+            switch e.type {
+            case .moveToPoint:
+                path.move(to: p[0])
+            case .addLineToPoint:
+                path.line(to: p[0])
+            case .addQuadCurveToPoint:
+                let p0 = path.currentPoint
+                let c1 = CGPoint(x: p0.x + 2.0 / 3.0 * (p[0].x - p0.x),
+                                 y: p0.y + 2.0 / 3.0 * (p[0].y - p0.y))
+                let c2 = CGPoint(x: p[1].x + 2.0 / 3.0 * (p[0].x - p[1].x),
+                                 y: p[1].y + 2.0 / 3.0 * (p[0].y - p[1].y))
+                path.curve(to: p[1], controlPoint1: c1, controlPoint2: c2)
+            case .addCurveToPoint:
+                path.curve(to: p[2], controlPoint1: p[0], controlPoint2: p[1])
+            case .closeSubpath:
+                path.close()
+            @unknown default:
+                break
+            }
+        }
+        return path
     }
 
     public static func averageWidth(of stroke: Stroke) -> CGFloat {
