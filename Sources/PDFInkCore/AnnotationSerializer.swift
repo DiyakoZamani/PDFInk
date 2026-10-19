@@ -29,7 +29,9 @@ public enum AnnotationSerializer {
 
         // Alpha goes into the color itself: PDFKit writes it as /CA on save,
         // and unlike a manually-set /CA key it also honors it when rendering.
-        let alpha: CGFloat = stroke.tool == .highlighter ? 0.4 : stroke.color.alpha
+        let alpha: CGFloat = stroke.tool == .highlighter
+            ? min(max(stroke.opacity ?? StrokeRenderer.highlighterAlpha, 0.05), 1)
+            : stroke.color.alpha
         annotation.color = NSColor(srgbRed: stroke.color.red,
                                    green: stroke.color.green,
                                    blue: stroke.color.blue,

@@ -107,7 +107,8 @@ final class DrawingCanvasView: NSView {
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
             guard let self else { return event }
-            return self.handleSpaceKey(event)   // nil = swallow, so PDFView never sees Space
+            if event.keyCode == 49 { return self.handleSpaceKey(event) }   // Space = hand tool
+            return self.handleToolShortcut(event)                          // Z / X / C
         }
         // If the window loses focus while Space is held, the key-up never arrives.
         notificationTokens.append(NotificationCenter.default.addObserver(
@@ -411,7 +412,8 @@ final class DrawingCanvasView: NSView {
                             color: toolState.color,
                             baseWidth: toolState.baseWidth,
                             pageIndex: activePageIndex,
-                            samples: activeSamples)
+                            samples: activeSamples,
+                            opacity: effectiveTool == .highlighter ? toolState.highlighterOpacity : nil)
         performAdd(stroke)
     }
 
@@ -511,11 +513,13 @@ final class DrawingCanvasView: NSView {
                 ctx.saveGState()
                 ctx.clip(to: pageRect.intersection(dirtyRect))
                 ctx.concatenate(pageToViewTransform(for: page))
-                let live = Stroke(tool: stylusIsEraserEnd ? .pen : toolState.tool,
+                let liveTool: Tool = stylusIsEraserEnd ? .pen : toolState.tool
+                let live = Stroke(tool: liveTool,
                                   color: toolState.color,
                                   baseWidth: toolState.baseWidth,
                                   pageIndex: pageIndex,
-                                  samples: activeSamples)
+                                  samples: activeSamples,
+                                  opacity: liveTool == .highlighter ? toolState.highlighterOpacity : nil)
                 StrokeRenderer.draw(live, in: ctx)
                 ctx.restoreGState()
             }
@@ -544,6 +548,25 @@ final class DrawingCanvasView: NSView {
 
         setSpaceHeld(true)
         return nil
+    }
+
+    /// Z = pen, X = eraser, C = highlighter (physical keys, so any keyboard layout works).
+    private func handleToolShortcut(_ event: NSEvent) -> NSEvent? {
+        guard event.type == .keyDown else { return event }
+        let tool: Tool
+        switch event.keyCode {
+        case 6: tool = .pen            // Z
+        case 7: tool = .eraser         // X
+        case 8: tool = .highlighter    // C
+        default: return event
+        }
+        guard let window, window.isKeyWindow, event.window === window,
+              !(window.firstResponder is NSTextView),     // typing in the hex field etc.
+              event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+              activePage == nil, !spaceHeld
+        else { return event }
+        if !event.isARepeat { toolState.tool = tool }
+        return nil                                         // swallow: no error beep
     }
 
     private func setSpaceHeld(_ held: Bool) {

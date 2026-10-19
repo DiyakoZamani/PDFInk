@@ -47,19 +47,23 @@ public struct Stroke: Codable, Equatable, Identifiable, Sendable {
     /// Index of the page this stroke belongs to.
     public var pageIndex: Int
     public var samples: [StrokeSample]
+    /// Highlighter opacity 0...1. nil = legacy default (StrokeRenderer.highlighterAlpha). Unused by the pen.
+    public var opacity: CGFloat?
 
     public init(id: UUID = UUID(),
                 tool: Tool,
                 color: StrokeColor,
                 baseWidth: CGFloat,
                 pageIndex: Int,
-                samples: [StrokeSample] = []) {
+                samples: [StrokeSample] = [],
+                opacity: CGFloat? = nil) {
         self.id = id
         self.tool = tool
         self.color = color
         self.baseWidth = baseWidth
         self.pageIndex = pageIndex
         self.samples = samples
+        self.opacity = opacity
     }
 
     /// Axis-aligned bounding box in page space, outset by the maximum possible width.

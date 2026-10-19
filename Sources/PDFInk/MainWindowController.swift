@@ -18,7 +18,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     private var savedGeneration: UInt64 = 0
 
     private var toolSegment: NSSegmentedControl?
-    private var widthSegment: NSSegmentedControl?
+    private var sizeSlider: NSSlider?
+    private var sizeLabel: NSTextField?
+    private var opacitySlider: NSSlider?
+    private var opacityLabel: NSTextField?
     private var swatchBar: ColorSwatchBar?
     private var colorPanelObserver: NSObjectProtocol?
     private var editingSlot: Int?
@@ -127,6 +130,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         static let tools = NSToolbarItem.Identifier("pdfink.tools")
         static let color = NSToolbarItem.Identifier("pdfink.color")
         static let width = NSToolbarItem.Identifier("pdfink.width")
+        static let opacity = NSToolbarItem.Identifier("pdfink.opacity")
     }
 
     private func setUpToolbar() {
@@ -179,20 +183,56 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     }
 
     fileprivate func makeWidthItem() -> NSToolbarItem {
-        let segment = NSSegmentedControl(
-            labels: ToolState.widthPresets.map(\.name),
-            trackingMode: .selectOne,
-            target: self,
-            action: #selector(widthChanged(_:)))
-        segment.selectedSegment = 1
-        widthSegment = segment
+        let slider = NSSlider(value: Double(toolState.baseWidth),
+                              minValue: Double(ToolState.penWidthRange.lowerBound),
+                              maxValue: Double(ToolState.penWidthRange.upperBound),
+                              target: self, action: #selector(sizeSliderChanged(_:)))
+        slider.isContinuous = true
+        let label = NSTextField(labelWithString: "")
+        sizeSlider = slider
+        sizeLabel = label
         let item = NSToolbarItem(itemIdentifier: ToolbarID.width)
-        item.label = "Width"
-        item.view = segment
+        item.label = "Size"
+        item.view = Self.makeSliderRow(title: "Size", slider: slider, valueLabel: label)
+        syncSliders()
         return item
     }
 
+    fileprivate func makeOpacityItem() -> NSToolbarItem {
+        let slider = NSSlider(value: Double(toolState.highlighterOpacity),
+                              minValue: Double(ToolState.opacityRange.lowerBound),
+                              maxValue: Double(ToolState.opacityRange.upperBound),
+                              target: self, action: #selector(opacitySliderChanged(_:)))
+        slider.isContinuous = true
+        let label = NSTextField(labelWithString: "")
+        opacitySlider = slider
+        opacityLabel = label
+        let item = NSToolbarItem(itemIdentifier: ToolbarID.opacity)
+        item.label = "Opacity"
+        item.view = Self.makeSliderRow(title: "Opacity", slider: slider, valueLabel: label)
+        syncSliders()
+        return item
+    }
 
+    private static func makeSliderRow(title: String, slider: NSSlider, valueLabel: NSTextField) -> NSView {
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.font = .systemFont(ofSize: 11)
+        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.alignment = .right
+        titleLabel.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        valueLabel.alignment = .left
+        valueLabel.widthAnchor.constraint(equalToConstant: 38).isActive = true
+        slider.widthAnchor.constraint(equalToConstant: 100).isActive = true
+
+        let stack = NSStackView(views: [titleLabel, slider, valueLabel])
+        stack.orientation = .horizontal
+        stack.spacing = 6
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.widthAnchor.constraint(equalToConstant: 46 + 100 + 38 + 12).isActive = true
+        stack.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        return stack
+    }
 
     private func syncToolbarSelection() {
         let toolIndex: Int
@@ -204,6 +244,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         }
         toolSegment?.selectedSegment = toolIndex
         swatchBar?.reload(from: palette)
+        syncSliders()
+    }
+
+    private func syncSliders() {
+        let isHighlighter = toolState.tool == .highlighter
+        let range = isHighlighter ? ToolState.highlighterWidthRange : ToolState.penWidthRange
+        sizeSlider?.minValue = Double(range.lowerBound)
+        sizeSlider?.maxValue = Double(range.upperBound)
+        sizeSlider?.doubleValue = Double(toolState.baseWidth)
+        sizeSlider?.isEnabled = (toolState.tool == .pen || isHighlighter)
+        sizeLabel?.stringValue = String(format: "%.1f", Double(toolState.baseWidth))
+
+        opacitySlider?.doubleValue = Double(toolState.highlighterOpacity)
+        opacitySlider?.isEnabled = isHighlighter
+        opacityLabel?.stringValue = "\(Int((toolState.highlighterOpacity * 100).rounded()))%"
     }
 
     @objc private func toolSegmentChanged(_ sender: NSSegmentedControl) {
@@ -214,9 +269,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
 
 
 
-    @objc private func widthChanged(_ sender: NSSegmentedControl) {
-        guard (0..<ToolState.widthPresets.count).contains(sender.selectedSegment) else { return }
-        toolState.baseWidth = ToolState.widthPresets[sender.selectedSegment].width
+    @objc private func sizeSliderChanged(_ sender: NSSlider) {
+        toolState.baseWidth = CGFloat((sender.doubleValue * 2).rounded() / 2)       // 0.5 steps
+    }
+
+    @objc private func opacitySliderChanged(_ sender: NSSlider) {
+        toolState.highlighterOpacity = CGFloat((sender.doubleValue * 20).rounded() / 20)   // 5% steps
     }
 
 
@@ -888,7 +946,7 @@ extension MainWindowController {
 
 extension MainWindowController {
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [ToolbarID.tools, .flexibleSpace, ToolbarID.color, ToolbarID.width]
+        [ToolbarID.tools, .flexibleSpace, ToolbarID.color, ToolbarID.width, ToolbarID.opacity]
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -902,6 +960,7 @@ extension MainWindowController {
         case ToolbarID.tools: return makeToolsItem()
         case ToolbarID.color: return makeColorItem()
         case ToolbarID.width: return makeWidthItem()
+        case ToolbarID.opacity: return makeOpacityItem()
         default: return nil
         }
     }

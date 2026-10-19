@@ -23,7 +23,7 @@ public enum StrokeRenderer {
             // Single stroked path at constant alpha: overlapping segments would
             // double-blend, so the whole stroke is one stroke operation.
             ctx.setBlendMode(.multiply)
-            ctx.setAlpha(highlighterAlpha)
+            ctx.setAlpha(min(max(stroke.opacity ?? highlighterAlpha, 0.05), 1))
             ctx.setLineWidth(StrokeGeometry.width(forPressure: 1, baseWidth: stroke.baseWidth, tool: .highlighter))
             ctx.addPath(StrokeGeometry.smoothedPath(stroke.samples))
             ctx.strokePath()
