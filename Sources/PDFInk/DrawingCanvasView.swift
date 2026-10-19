@@ -61,6 +61,23 @@ final class DrawingCanvasView: NSView {
     private var lastPanWindowPoint: CGPoint = .zero
     private var keyMonitor: Any?
 
+    // Lasso
+    private enum LassoDrag: Equatable {
+        case drawing                        // freehand selection loop
+        case move
+        case scale(anchor: CGPoint)         // page space: the opposite corner stays fixed
+        case rotate(center: CGPoint)        // page space
+    }
+    private var lassoDrag: LassoDrag?
+    private var lassoPath: [CGPoint] = []            // view space, while drawing the loop
+    private var lassoPage: PDFPage?
+    private var lassoPageIndex = -1
+    private var selectedIDs: Set<UUID> = []
+    private var selectionPageIndex = -1
+    private var dragStartPagePoint: CGPoint = .zero
+    private var dragOriginals: [Stroke] = []
+    private var dragHasMoved = false
+
     // MARK: Committed-stroke bitmap caches, one per page
     private final class PageCache {
         let context: CGContext
@@ -155,20 +172,23 @@ final class DrawingCanvasView: NSView {
         return true
     }
 
-    /// Called by the owner whenever the stroke store mutates (draw/erase/undo).
     func storeDidChange(pageIndex: Int) {
         invalidateCache(forPage: pageIndex)
+        if pageIndex == selectionPageIndex {                       // drop selected ids that no longer exist
+            let existing = Set(store.strokes(onPage: pageIndex).map(\.id))
+            selectedIDs = selectedIDs.intersection(existing)
+            if selectedIDs.isEmpty { selectionPageIndex = -1 }
+        }
         needsDisplay = true
     }
 
-    /// Called when page structure changes (add/delete page), which shifts page
-    /// indices and invalidates every committed-stroke cache.
     func storeStructureDidChange() {
+        clearSelection()
         invalidateAllCaches()
     }
 
-    /// Called by the owner when the active tool/color/width changes.
     func toolStateDidChange() {
+        if toolState.tool != .lasso, !selectedIDs.isEmpty { clearSelection() }
         window?.invalidateCursorRects(for: self)
         activeCursor.set()
     }
@@ -351,7 +371,7 @@ final class DrawingCanvasView: NSView {
         case .eraser:
             erase(at: viewPoint, page: page, pageIndex: pageIndex)
         case .lasso:
-            NSLog("PDFInk: lasso select is not implemented yet")
+            beginLasso(at: viewPoint, page: page, pageIndex: pageIndex)
         case .pen, .highlighter:
             activePage = page
             activePageIndex = pageIndex
@@ -367,6 +387,8 @@ final class DrawingCanvasView: NSView {
         reassertCursor()
         let viewPoint = viewPoint(for: event)
         let effectiveTool = stylusIsEraserEnd ? .eraser : toolState.tool
+
+        if lassoDrag != nil { lassoDragged(to: viewPoint); return }
 
         if effectiveTool == .eraser {
             if let (page, pageIndex) = page(at: viewPoint) {
@@ -395,7 +417,9 @@ final class DrawingCanvasView: NSView {
             isPanning = false                            // NEW
             reassertCursor()                             // NEW
             return                                       // NEW
-        }                                                // NEW
+        }
+
+        if lassoDrag != nil { lassoEnded(); return }        // NEW
         reassertCursor()
 
         defer {
@@ -524,6 +548,7 @@ final class DrawingCanvasView: NSView {
                 ctx.restoreGState()
             }
         }
+        drawLassoOverlay()
     }
 
     // MARK: - Hand tool (hold Space to pan)
@@ -550,23 +575,37 @@ final class DrawingCanvasView: NSView {
         return nil
     }
 
-    /// Z = pen, X = eraser, C = highlighter (physical keys, so any keyboard layout works).
+    /// Z pen, X eraser, C highlighter, V lasso. With a lasso selection: Delete/Backspace/X delete it, Esc deselects.
     private func handleToolShortcut(_ event: NSEvent) -> NSEvent? {
         guard event.type == .keyDown else { return event }
-        let tool: Tool
+        let tool: Tool?
         switch event.keyCode {
         case 6: tool = .pen            // Z
         case 7: tool = .eraser         // X
         case 8: tool = .highlighter    // C
+        case 9: tool = .lasso          // V
+        case 51, 117, 53: tool = nil   // Delete, Forward Delete, Esc
         default: return event
         }
         guard let window, window.isKeyWindow, event.window === window,
-              !(window.firstResponder is NSTextView),     // typing in the hex field etc.
+              !(window.firstResponder is NSTextView),
               event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
-              activePage == nil, !spaceHeld
+              activePage == nil, lassoDrag == nil, !spaceHeld
         else { return event }
+
+        let hasSelection = !selectedStrokes.isEmpty
+        switch event.keyCode {
+        case 7 where hasSelection, 51 where hasSelection, 117 where hasSelection:
+            if !event.isARepeat { deleteSelection() }
+            return nil
+        case 53 where hasSelection:
+            clearSelection()
+            return nil
+        default: break
+        }
+        guard let tool else { return event }      // Delete/Esc with no selection: pass through
         if !event.isARepeat { toolState.tool = tool }
-        return nil                                         // swallow: no error beep
+        return nil
     }
 
     private func setSpaceHeld(_ held: Bool) {
@@ -591,6 +630,231 @@ final class DrawingCanvasView: NSView {
         let target = clip.constrainBoundsRect(NSRect(origin: origin, size: clip.bounds.size)).origin
         clip.scroll(to: target)
         scrollView.reflectScrolledClipView(clip)
+    }
+
+    // MARK: - Lasso select / transform
+
+    private var selectedStrokes: [Stroke] {
+        guard selectionPageIndex >= 0 else { return [] }
+        return store.strokes(onPage: selectionPageIndex).filter { selectedIDs.contains($0.id) }
+    }
+
+    private func clearSelection() {
+        selectedIDs = []
+        selectionPageIndex = -1
+        lassoDrag = nil
+        lassoPath = []
+        needsDisplay = true
+    }
+
+    private func deleteSelection() {
+        let victims = selectedStrokes
+        let pageIndex = selectionPageIndex
+        selectedIDs = []
+        selectionPageIndex = -1
+        for s in victims {
+            performRemove(strokeID: s.id, pageIndex: pageIndex, actionName: "Delete Selection")
+        }
+        needsDisplay = true
+    }
+
+    private struct SelectionGeometry {
+        var corners: [CGPoint]        // view space: bottom-left, bottom-right, top-right, top-left
+        var center: CGPoint
+        var topMid: CGPoint
+        var rotateHandle: CGPoint
+    }
+
+    private func selectionGeometry(page: PDFPage) -> SelectionGeometry? {
+        let strokes = selectedStrokes
+        guard var rect = strokes.first?.pageBounds, !rect.isNull else { return nil }
+        for s in strokes.dropFirst() { rect = rect.union(s.pageBounds) }
+        let corners = [CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: rect.maxX, y: rect.minY),
+                       CGPoint(x: rect.maxX, y: rect.maxY), CGPoint(x: rect.minX, y: rect.maxY)]
+            .map { pageToView($0, page: page) }
+        let center = CGPoint(x: corners.map(\.x).reduce(0, +) / 4, y: corners.map(\.y).reduce(0, +) / 4)
+        let topMid = CGPoint(x: (corners[2].x + corners[3].x) / 2, y: (corners[2].y + corners[3].y) / 2)
+        let dx = topMid.x - center.x, dy = topMid.y - center.y
+        let len = max(hypot(dx, dy), 1)
+        let handle = CGPoint(x: topMid.x + dx / len * 24, y: topMid.y + dy / len * 24)
+        return SelectionGeometry(corners: corners, center: center, topMid: topMid, rotateHandle: handle)
+    }
+
+    private static func polygonContains(_ poly: [CGPoint], _ p: CGPoint) -> Bool {
+        guard poly.count >= 3 else { return false }
+        var inside = false
+        var j = poly.count - 1
+        for i in 0..<poly.count {
+            let a = poly[i], b = poly[j]
+            if (a.y > p.y) != (b.y > p.y),
+               p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+                inside.toggle()
+            }
+            j = i
+        }
+        return inside
+    }
+
+    private func lassoHit(_ p: CGPoint, page: PDFPage) -> LassoDrag? {
+        guard let g = selectionGeometry(page: page) else { return nil }
+        let r: CGFloat = 11
+        func near(_ a: CGPoint) -> Bool { hypot(a.x - p.x, a.y - p.y) <= r }
+        if near(g.rotateHandle) { return .rotate(center: viewToPage(g.center, page: page)) }
+        for i in 0..<4 where near(g.corners[i]) {
+            return .scale(anchor: viewToPage(g.corners[(i + 2) % 4], page: page))
+        }
+        if Self.polygonContains(g.corners, p) { return .move }
+        return nil
+    }
+
+    private func beginLasso(at viewPoint: CGPoint, page: PDFPage, pageIndex: Int) {
+        if selectionPageIndex == pageIndex, let hit = lassoHit(viewPoint, page: page) {
+            lassoDrag = hit
+            dragStartPagePoint = viewToPage(viewPoint, page: page)
+            dragOriginals = selectedStrokes
+            dragHasMoved = false
+            return
+        }
+        clearSelection()
+        lassoDrag = .drawing
+        lassoPage = page
+        lassoPageIndex = pageIndex
+        lassoPath = [viewPoint]
+    }
+
+    private func lassoDragged(to viewPoint: CGPoint) {
+        guard let drag = lassoDrag else { return }
+        if drag == .drawing {
+            if let last = lassoPath.last, hypot(viewPoint.x - last.x, viewPoint.y - last.y) < 2 { return }
+            lassoPath.append(viewPoint)
+            needsDisplay = true
+            return
+        }
+        guard let page = pdfView?.document?.page(at: selectionPageIndex) else { return }
+        let p = viewToPage(viewPoint, page: page)
+        var widthScale: CGFloat = 1
+        let t: CGAffineTransform
+        switch drag {
+        case .move:
+            t = CGAffineTransform(translationX: p.x - dragStartPagePoint.x, y: p.y - dragStartPagePoint.y)
+        case .scale(let a):
+            let d0 = hypot(dragStartPagePoint.x - a.x, dragStartPagePoint.y - a.y)
+            let d1 = hypot(p.x - a.x, p.y - a.y)
+            let f = min(max(d1 / max(d0, 1), 0.05), 20)
+            widthScale = f
+            t = CGAffineTransform(translationX: a.x, y: a.y).scaledBy(x: f, y: f).translatedBy(x: -a.x, y: -a.y)
+        case .rotate(let c):
+            let a0 = atan2(dragStartPagePoint.y - c.y, dragStartPagePoint.x - c.x)
+            let a1 = atan2(p.y - c.y, p.x - c.x)
+            t = CGAffineTransform(translationX: c.x, y: c.y).rotated(by: a1 - a0).translatedBy(x: -c.x, y: -c.y)
+        case .drawing:
+            return
+        }
+        // Always transform from the originals, so there is no drift while dragging.
+        for s in dragOriginals { store.replace(s.applying(t, widthScale: widthScale)) }
+        dragHasMoved = true
+    }
+
+    private func lassoEnded() {
+        guard let drag = lassoDrag else { return }
+        lassoDrag = nil
+        if drag == .drawing {
+            finishLassoSelection()
+        } else if dragHasMoved {
+            registerReplace(old: dragOriginals, new: selectedStrokes, actionName: "Transform Selection")
+        }
+        dragOriginals = []
+        dragHasMoved = false
+        needsDisplay = true
+    }
+
+    private func finishLassoSelection() {
+        defer { lassoPath = []; lassoPage = nil; needsDisplay = true }
+        guard let page = lassoPage, let first = lassoPath.first else { return }
+        let pageIndex = lassoPageIndex
+
+        let xs = lassoPath.map(\.x), ys = lassoPath.map(\.y)
+        let diagonal = hypot((xs.max() ?? 0) - (xs.min() ?? 0), (ys.max() ?? 0) - (ys.min() ?? 0))
+
+        if diagonal < 5 {   // a tap: select the stroke under the pointer
+            let tolerance = 6.0 / max(pdfView?.scaleFactor ?? 1, 0.01)
+            if let hit = store.hitTest(point: viewToPage(first, page: page), pageIndex: pageIndex, tolerance: tolerance) {
+                selectedIDs = [hit.id]
+                selectionPageIndex = pageIndex
+            }
+            return
+        }
+        guard lassoPath.count >= 3 else { return }
+
+        let polygon = lassoPath.map { viewToPage($0, page: page) }
+        let chosen = store.strokes(onPage: pageIndex).filter { stroke in
+            guard !stroke.samples.isEmpty else { return false }
+            let inside = stroke.samples.filter { Self.polygonContains(polygon, $0.point) }.count
+            return Double(inside) / Double(stroke.samples.count) >= 0.5      // selection threshold
+        }
+        selectedIDs = Set(chosen.map(\.id))
+        selectionPageIndex = chosen.isEmpty ? -1 : pageIndex
+    }
+
+    // Undo for transforms: swap between two sets of stroke versions.
+    private func registerReplace(old: [Stroke], new: [Stroke], actionName: String) {
+        undoManager?.registerUndo(withTarget: self) { target in
+            target.applyReplace(strokes: old, undoTo: new, actionName: actionName)
+        }
+        undoManager?.setActionName(actionName)
+    }
+
+    private func applyReplace(strokes: [Stroke], undoTo other: [Stroke], actionName: String) {
+        strokes.forEach { store.replace($0) }
+        registerReplace(old: other, new: strokes, actionName: actionName)
+    }
+
+    private func drawLassoOverlay() {
+        let accent = NSColor.controlAccentColor
+
+        if lassoDrag == .drawing, lassoPath.count > 1 {
+            let path = NSBezierPath()
+            path.move(to: lassoPath[0])
+            for p in lassoPath.dropFirst() { path.line(to: p) }
+            path.close()
+            accent.withAlphaComponent(0.10).setFill()
+            path.fill()
+            path.lineWidth = 1.5
+            path.setLineDash([6, 4], count: 2, phase: 0)
+            accent.setStroke()
+            path.stroke()
+        }
+
+        guard selectionPageIndex >= 0,
+              let page = pdfView?.document?.page(at: selectionPageIndex),
+              let g = selectionGeometry(page: page) else { return }
+
+        let box = NSBezierPath()
+        box.move(to: g.corners[0])
+        for c in g.corners.dropFirst() { box.line(to: c) }
+        box.close()
+        box.lineWidth = 1
+        box.setLineDash([4, 3], count: 2, phase: 0)
+        accent.setStroke()
+        box.stroke()
+
+        let stem = NSBezierPath()
+        stem.move(to: g.topMid)
+        stem.line(to: g.rotateHandle)
+        stem.lineWidth = 1
+        stem.stroke()
+
+        func handle(at p: CGPoint, round: Bool) {
+            let rect = CGRect(x: p.x - 5, y: p.y - 5, width: 10, height: 10)
+            let shape = round ? NSBezierPath(ovalIn: rect) : NSBezierPath(rect: rect)
+            NSColor.white.setFill()
+            shape.fill()
+            shape.lineWidth = 1.5
+            accent.setStroke()
+            shape.stroke()
+        }
+        g.corners.forEach { handle(at: $0, round: false) }
+        handle(at: g.rotateHandle, round: true)
     }
 
     // MARK: - Cursor

@@ -33,9 +33,13 @@ final class ToolState {
 
     var onChange: (() -> Void)?
 
+    private var eraserSetByStylus = false
+    private var applyingStylusSwitch = false
+
     var tool: Tool = .pen {
         didSet {
             if oldValue != tool, oldValue != .eraser { lastDrawingTool = oldValue }
+            if !applyingStylusSwitch { eraserSetByStylus = false }   // user picked a tool manually
             onChange?()
         }
     }
@@ -88,12 +92,18 @@ final class ToolState {
     }
 
     /// Called from tablet proximity handling when the stylus is flipped.
+    /// Only reverts the tool if the eraser was activated by the stylus itself.
     func stylusEnteredProximity(isEraserEnd: Bool) {
+        applyingStylusSwitch = true
+        defer { applyingStylusSwitch = false }
         if isEraserEnd {
-            if tool != .eraser { lastDrawingTool = tool }
-            tool = .eraser
-        } else if tool == .eraser {
-            tool = lastDrawingTool == .eraser ? .pen : lastDrawingTool
+            if tool != .eraser {
+                eraserSetByStylus = true
+                tool = .eraser
+            }
+        } else if eraserSetByStylus {
+            eraserSetByStylus = false
+            if tool == .eraser { tool = lastDrawingTool == .eraser ? .pen : lastDrawingTool }
         }
     }
 

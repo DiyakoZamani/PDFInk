@@ -66,6 +66,14 @@ public struct Stroke: Codable, Equatable, Identifiable, Sendable {
         self.opacity = opacity
     }
 
+    /// Returns a copy with all sample points transformed. `widthScale` scales the pen width too.
+    public func applying(_ t: CGAffineTransform, widthScale: CGFloat = 1) -> Stroke {
+        var s = self
+        s.samples = samples.map { StrokeSample(point: $0.point.applying(t), pressure: $0.pressure) }
+        s.baseWidth = baseWidth * widthScale
+        return s
+    }
+
     /// Axis-aligned bounding box in page space, outset by the maximum possible width.
     public var pageBounds: CGRect {
         guard let first = samples.first else { return .null }

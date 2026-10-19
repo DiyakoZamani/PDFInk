@@ -173,7 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toolsMenu.addItem(withTitle: "Pen", action: #selector(MainWindowController.selectPenAction(_:)), keyEquivalent: "1")
         toolsMenu.addItem(withTitle: "Highlighter", action: #selector(MainWindowController.selectHighlighterAction(_:)), keyEquivalent: "2")
         toolsMenu.addItem(withTitle: "Eraser", action: #selector(MainWindowController.selectEraserAction(_:)), keyEquivalent: "3")
-        toolsMenu.addItem(withTitle: "Lasso Select (coming soon)", action: nil, keyEquivalent: "4")
+        toolsMenu.addItem(withTitle: "Lasso Select", action: #selector(MainWindowController.selectLassoAction(_:)), keyEquivalent: "4")
 
         NSApp.mainMenu = mainMenu
     }

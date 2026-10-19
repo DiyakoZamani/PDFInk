@@ -872,6 +872,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     @objc func selectPenAction(_ sender: Any?) { toolState.tool = .pen }
     @objc func selectHighlighterAction(_ sender: Any?) { toolState.tool = .highlighter }
     @objc func selectEraserAction(_ sender: Any?) { toolState.tool = .eraser }
+    @objc func selectLassoAction(_ sender: Any?) { toolState.tool = .lasso }
 
     @objc func undo(_ sender: Any?) { window?.undoManager?.undo() }
     @objc func redo(_ sender: Any?) { window?.undoManager?.redo() }

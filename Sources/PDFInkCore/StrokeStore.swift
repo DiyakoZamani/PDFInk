@@ -67,6 +67,18 @@ public final class StrokeStore: Codable {
         onChange?(stroke.pageIndex)
     }
 
+    /// Replaces the stroke with the same id in place (keeps z-order). Used by lasso transforms.
+    @discardableResult
+    public func replace(_ stroke: Stroke) -> Bool {
+        guard var pageStrokes = strokesByPage[stroke.pageIndex],
+              let idx = pageStrokes.firstIndex(where: { $0.id == stroke.id }) else { return false }
+        pageStrokes[idx] = stroke
+        strokesByPage[stroke.pageIndex] = pageStrokes
+        generation &+= 1
+        onChange?(stroke.pageIndex)
+        return true
+    }
+
     @discardableResult
     public func remove(id: UUID, pageIndex: Int) -> Stroke? {
         guard var pageStrokes = strokesByPage[pageIndex],
