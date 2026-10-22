@@ -125,6 +125,15 @@ final class DrawingCanvasView: NSView {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
             guard let self else { return event }
             if event.keyCode == 49 { return self.handleSpaceKey(event) }   // Space = hand tool
+            // T selects PDF text. Ignore modified shortcuts and typing into
+            // text fields so this does not steal normal keyboard input.
+            if event.type == .keyDown,
+               event.charactersIgnoringModifiers?.lowercased() == "t",
+               event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+               !(self.window?.firstResponder is NSTextView) {
+                self.toolState.isTextSelectionEnabled.toggle()
+                return nil
+            }
             return self.handleToolShortcut(event)                          // Z / X / C
         }
         // If the window loses focus while Space is held, the key-up never arrives.
@@ -148,6 +157,14 @@ final class DrawingCanvasView: NSView {
 
     override var isFlipped: Bool { false }
     override var acceptsFirstResponder: Bool { true }
+
+    /// Returning nil lets PDFView receive mouse events instead of the overlay.
+    /// This is intentionally all-or-nothing: pen/eraser/lasso input remains
+    /// untouched whenever Text Select is not the active tool.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !toolState.isTextSelectionEnabled else { return nil }
+        return super.hitTest(point)
+    }
 
     // MARK: - PDF drag and drop
 

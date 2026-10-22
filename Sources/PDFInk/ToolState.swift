@@ -33,11 +33,21 @@ final class ToolState {
 
     var onChange: (() -> Void)?
 
+    /// When enabled, pointer events pass through the drawing overlay to PDFView,
+    /// allowing PDFKit's native text selection and copy behaviour.
+    var isTextSelectionEnabled = false {
+        didSet {
+            guard oldValue != isTextSelectionEnabled else { return }
+            onChange?()
+        }
+    }
+
     private var eraserSetByStylus = false
     private var applyingStylusSwitch = false
 
     var tool: Tool = .pen {
         didSet {
+            isTextSelectionEnabled = false
             if oldValue != tool, oldValue != .eraser { lastDrawingTool = oldValue }
             if !applyingStylusSwitch { eraserSetByStylus = false }   // user picked a tool manually
             onChange?()
