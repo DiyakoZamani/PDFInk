@@ -905,6 +905,7 @@ final class DrawingCanvasView: NSView {
 
     private var activeCursor: NSCursor {
         if spaceHeld { return isPanning ? .closedHand : .openHand }
+        if toolState.isTextSelectionEnabled { return .iBeam }
         return toolState.tool == .eraser ? .disappearingItem : Self.circleCursor
     }
 
