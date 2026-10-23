@@ -126,13 +126,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         newWhiteboardItem.submenu = newWhiteboardMenu
         fileMenu.addItem(newWhiteboardItem)
 
-        let addPageItem = fileMenu.addItem(withTitle: "Add Page",
+        let blankDocItem = fileMenu.addItem(withTitle: "Create a Blank Document…",
+                                            action: #selector(MainWindowController.newBlankDocumentAction(_:)),
+                                            keyEquivalent: "n")
+        blankDocItem.keyEquivalentModifierMask = [.command, .option]
+        let addPageItem = fileMenu.addItem(withTitle: "Add Pages…",
                                            action: #selector(MainWindowController.addPageAction(_:)),
                                            keyEquivalent: "n")
         addPageItem.keyEquivalentModifierMask = [.command, .shift]
-        fileMenu.addItem(withTitle: "Add Multiple Pages…",
-                         action: #selector(MainWindowController.addMultiplePagesAction(_:)),
-                         keyEquivalent: "")
         fileMenu.addItem(withTitle: "Delete Page",
                          action: #selector(MainWindowController.deletePageAction(_:)),
                          keyEquivalent: "")

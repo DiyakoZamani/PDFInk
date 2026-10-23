@@ -9,6 +9,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     let thumbnailView = PageSidebarView()
     private let dropContainer = DropContainerView()
     private let placeholderLabel = NSTextField(labelWithString: "Drop a PDF here or use File ▸ Open (⌘O)")
+    private lazy var createBlankButton: NSButton = {
+        let button = NSButton(title: "Create a blank document",
+                              target: self,
+                              action: #selector(newBlankDocumentAction(_:)))
+        button.bezelStyle = .rounded
+        button.controlSize = .large
+        return button
+    }()
 
     let store = StrokeStore()
     let toolState = ToolState()
@@ -78,6 +86,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         thumbnailView.pageMenuProvider = { [weak self] index in
             self?.pageContextMenu(for: index)
         }
+        thumbnailView.onMovePage = { [weak self] from, to in
+            self?.movePage(from: from, to: to)
+        }
         thumbnailView.onDeleteKey = { [weak self] in
             guard let self, let index = self.thumbnailView.selectedPageIndex else { return }
             self.deletePage(at: index)
@@ -103,6 +114,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         contentView.addSubview(dropContainer)
         dropContainer.addSubview(splitView)
         dropContainer.addSubview(placeholderLabel)
+        createBlankButton.translatesAutoresizingMaskIntoConstraints = false
+        dropContainer.addSubview(createBlankButton)
 
         // Drawing overlay sits on top of the PDFView, same frame, and maps all
         // input through PDFView's page geometry.
@@ -121,6 +134,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
             splitView.trailingAnchor.constraint(equalTo: dropContainer.trailingAnchor),
             placeholderLabel.centerXAnchor.constraint(equalTo: dropContainer.centerXAnchor),
             placeholderLabel.centerYAnchor.constraint(equalTo: dropContainer.centerYAnchor),
+            createBlankButton.centerXAnchor.constraint(equalTo: dropContainer.centerXAnchor),
+            createBlankButton.topAnchor.constraint(equalTo: placeholderLabel.bottomAnchor, constant: 16),
         ])
     }
 
@@ -143,16 +158,38 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
 
     fileprivate func makeToolsItem() -> NSToolbarItem {
         let segment = NSSegmentedControl(
-            labels: ["✏️ Pen", "🖍 Highlight", "◻️ Erase", "◌ Lasso"],
+            labels: ["✏️ Pen", "🖍 Highlight", "◻️ Erase", "◌ Lasso", ""],
             trackingMode: .selectOne,
             target: self,
             action: #selector(toolSegmentChanged(_:)))
+        segment.setImage(Self.textToolIcon(), forSegment: 4)
+        segment.setImageScaling(.scaleProportionallyDown, forSegment: 4)
+        segment.setToolTip("Text Select (T)", forSegment: 4)
+        segment.setWidth(36, forSegment: 4)
         segment.selectedSegment = 0
         toolSegment = segment
         let item = NSToolbarItem(itemIdentifier: ToolbarID.tools)
         item.label = "Tools"
         item.view = segment
         return item
+    }
+
+    /// A bold "T" glyph used as the Text Select tool's toolbar icon (template
+    /// image, so it follows the system tint and selection state).
+    private static func textToolIcon() -> NSImage {
+        let image = NSImage(size: NSSize(width: 16, height: 16), flipped: false) { rect in
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 15, weight: .bold),
+                .foregroundColor: NSColor.black,
+            ]
+            let glyph = NSAttributedString(string: "T", attributes: attributes)
+            let glyphSize = glyph.size()
+            glyph.draw(at: NSPoint(x: rect.midX - glyphSize.width / 2,
+                                   y: rect.midY - glyphSize.height / 2))
+            return true
+        }
+        image.isTemplate = true
+        return image
     }
 
     fileprivate func makeColorItem() -> NSToolbarItem {
@@ -235,13 +272,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     }
 
     private func syncToolbarSelection() {
-        let toolIndex: Int
+        var toolIndex: Int
         switch toolState.tool {
         case .pen: toolIndex = 0
         case .highlighter: toolIndex = 1
         case .eraser: toolIndex = 2
         case .lasso: toolIndex = 3
         }
+        if toolState.isTextSelectionEnabled { toolIndex = 4 }   // Text Select ("T")
         toolSegment?.selectedSegment = toolIndex
         swatchBar?.reload(from: palette)
         syncSliders()
@@ -262,6 +300,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     }
 
     @objc private func toolSegmentChanged(_ sender: NSSegmentedControl) {
+        if sender.selectedSegment == 4 {            // Text Select
+            toolState.isTextSelectionEnabled = true
+            return
+        }
         let tools: [Tool] = [.pen, .highlighter, .eraser, .lasso]
         guard (0..<tools.count).contains(sender.selectedSegment) else { return }
         toolState.tool = tools[sender.selectedSegment]
@@ -417,6 +459,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
             pdfView.go(to: PDFDestination(page: firstPage, at: top))
         }
         placeholderLabel.isHidden = true
+        createBlankButton.isHidden = true
         savedGeneration = store.generation
         window?.isDocumentEdited = false
         autosave.begin(documentURL: url)
@@ -464,9 +507,67 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         }
     }
 
-    /// Appends a page matching the whiteboard's template (blank for PDFs).
-    /// Interactive invocations (menu/keyboard) prompt for the page dimensions;
-    /// programmatic calls (dev harness, tests) use the current page's size.
+    // MARK: - Blank documents
+
+    static func documentsDirectory() throws -> URL {
+        let docs = try FileManager.default.url(for: .documentDirectory,
+                                               in: .userDomainMask,
+                                               appropriateFor: nil, create: true)
+        let dir = docs.appendingPathComponent("PDFInk Documents", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// File ▸ Create a Blank Document… (and the button on the start screen):
+    /// asks for page count and size, then creates and opens the document.
+    @objc func newBlankDocumentAction(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Create a Blank Document"
+        alert.informativeText = "Choose how many pages the document has and their size."
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        let form = BlankDocumentForm()
+        alert.accessoryView = form.view
+        alert.window.initialFirstResponder = form.initialResponder
+
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard let options = form.result() else {
+            presentError(message: "Invalid input",
+                         info: "Pages must be 1–1000 and width/height must be positive numbers (in points).")
+            return
+        }
+        createBlankDocument(pageCount: options.count, size: options.size)
+    }
+
+    /// Writes a blank PDF (saved in ~/Documents/PDFInk Documents so save and
+    /// autosave work right away) and opens it.
+    func createBlankDocument(pageCount: Int, size: CGSize) {
+        do {
+            let dir = try Self.documentsDirectory()
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH.mm"
+            let stamp = formatter.string(from: Date())
+            var url = dir.appendingPathComponent("Untitled \(stamp).pdf")
+            var counter = 2
+            while FileManager.default.fileExists(atPath: url.path) {
+                url = dir.appendingPathComponent("Untitled \(stamp) (\(counter)).pdf")
+                counter += 1
+            }
+            try WhiteboardTemplate.blank.pdfData(pageCount: pageCount, size: size).write(to: url)
+            openPDF(at: url)
+            NSLog("PDFInk: created blank document with %d pages (%.0fx%.0f pt) at %@",
+                  pageCount, size.width, size.height, url.path)
+        } catch {
+            presentError(message: "Couldn't create document", info: error.localizedDescription)
+        }
+    }
+
+    // MARK: - Adding pages
+
+    /// Adds pages matching the whiteboard's template (blank for PDFs).
+    /// Interactive invocations (menu/keyboard) prompt for count, size and
+    /// placement (after the current page or at the end); programmatic calls
+    /// (dev harness, tests) append one page at the current page's size.
     @objc func addPageAction(_ sender: Any?) {
         guard let document = pdfView.document else { return }
         let template = whiteboardTemplate ?? .blank
@@ -474,78 +575,68 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         let defaultSize = (pdfView.currentPage ?? document.page(at: document.pageCount - 1))?
             .bounds(for: pdfView.displayBox).size ?? WhiteboardTemplate.pageSize
 
-        let pageSize: CGSize
+        let request: (count: Int, size: CGSize, afterCurrent: Bool)
         if sender != nil {
-            guard let chosen = promptForPageSize(defaultSize: defaultSize) else { return }
-            pageSize = chosen
+            guard let chosen = promptForAddPages(defaultSize: defaultSize) else { return }
+            request = chosen
         } else {
-            pageSize = defaultSize
+            request = (1, defaultSize, false)
         }
 
-        guard let page = template.makePage(size: pageSize) else { return }
-        document.insert(page, at: document.pageCount)
-        pdfView.layoutDocumentView()
-        window?.isDocumentEdited = true
-        // Scroll to the new page so it's ready to draw on.
-        if let newPage = document.page(at: document.pageCount - 1) {
-            let top = CGPoint(x: 0, y: newPage.bounds(for: pdfView.displayBox).maxY)
-            pdfView.go(to: PDFDestination(page: newPage, at: top))
-        }
-        NSLog("PDFInk: added %@ page (%.0fx%.0f pt), document now has %d pages",
-              template.rawValue, pageSize.width, pageSize.height, document.pageCount)
-        // Persist the new page structure immediately for every document.
-        // The draft/autosave mechanism only serializes strokes (keyed by page
-        // index), not pages, so an unsaved added page would vanish on restart
-        // and leave its ink orphaned. Writing now (which also records current
-        // strokes as ink annotations) keeps Add Page durable like whiteboards.
-        saveDocumentAction(nil)
+        guard request.count > 0 else { return }
+        addPages(count: request.count, size: request.size, template: template,
+                 afterCurrent: request.afterCurrent)
     }
 
-    @objc func addMultiplePagesAction(_ sender: Any?) {
+    private func addPages(count: Int, size: CGSize, template: WhiteboardTemplate, afterCurrent: Bool) {
         guard let document = pdfView.document else { return }
-        let template = whiteboardTemplate ?? .blank
 
-        let defaultSize = (pdfView.currentPage ?? document.page(at: document.pageCount - 1))?
-            .bounds(for: pdfView.displayBox).size ?? WhiteboardTemplate.pageSize
-
-        let (count, pageSize): (Int, CGSize)
-        if sender != nil {
-            guard let chosen = promptForPageCountAndSize(defaultSize: defaultSize) else { return }
-            count = chosen.count
-            pageSize = chosen.size
-        } else {
-            count = 1
-            pageSize = defaultSize
+        // Where the first new page goes: right after the current page, or at the end.
+        var insertionIndex = document.pageCount
+        if afterCurrent, let current = pdfView.currentPage {
+            let currentIndex = document.index(for: current)
+            if currentIndex != NSNotFound { insertionIndex = currentIndex + 1 }
         }
 
-        guard count > 0 else { return }
-        addPages(count: count, size: pageSize, template: template)
-    }
-
-    private func addPages(count: Int, size: CGSize, template: WhiteboardTemplate) {
-        guard let document = pdfView.document else { return }
-
+        var firstPage: PDFPage?
         var lastPage: PDFPage?
-        for _ in 0..<count {
+        var shiftedExistingPages = false
+        for i in 0..<count {
             guard let page = template.makePage(size: size) else { break }
-            document.insert(page, at: document.pageCount)
+            let index = insertionIndex + i
+            document.insert(page, at: index)
+            // Pages that were after the insertion point moved down one; their ink
+            // is keyed by page index, so it has to move with them.
+            if index < document.pageCount - 1 {
+                store.insertPage(at: index, strokes: [])
+                shiftedExistingPages = true
+            }
+            if firstPage == nil { firstPage = page }
             lastPage = page
         }
         pdfView.layoutDocumentView()
+        if shiftedExistingPages { canvas?.storeStructureDidChange() }
         window?.isDocumentEdited = true
-        if let lastPage {
-            let top = CGPoint(x: 0, y: lastPage.bounds(for: pdfView.displayBox).maxY)
-            pdfView.go(to: PDFDestination(page: lastPage, at: top))
+
+        // Scroll to the new pages: the first one when inserting after the
+        // current page, otherwise the last one at the end of the document.
+        if let target = afterCurrent ? firstPage : lastPage {
+            let top = CGPoint(x: 0, y: target.bounds(for: pdfView.displayBox).maxY)
+            pdfView.go(to: PDFDestination(page: target, at: top))
         }
-        let finalPageCount = document.pageCount
-        NSLog("PDFInk: added %d %@ pages (%.0fx%.0f pt), document now has %d pages",
-              count, template.rawValue, size.width, size.height, finalPageCount)
+        NSLog("PDFInk: added %d %@ pages (%.0fx%.0f pt) at index %d, document now has %d pages",
+              count, template.rawValue, size.width, size.height, insertionIndex, document.pageCount)
+        // Persist the new page structure immediately: the draft/autosave mechanism
+        // only serializes strokes (keyed by page index), not pages, so unsaved
+        // pages would vanish on restart and leave their ink orphaned.
         saveDocumentAction(nil)
     }
 
-    private func promptForPageCountAndSize(defaultSize: CGSize) -> (count: Int, size: CGSize)? {
+    /// Prompts for how many pages to add, their size in PDF points, and whether
+    /// they go after the current page. Returns nil on cancel/invalid input.
+    private func promptForAddPages(defaultSize: CGSize) -> (count: Int, size: CGSize, afterCurrent: Bool)? {
         let alert = NSAlert()
-        alert.messageText = "Add Multiple Pages"
+        alert.messageText = "Add Pages"
         alert.informativeText = "Enter how many pages to add and their size (in points; 72 pt = 1 inch)."
         alert.addButton(withTitle: "Add")
         alert.addButton(withTitle: "Cancel")
@@ -569,15 +660,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
             return stack
         }
 
+        let afterCurrentCheckbox = NSButton(checkboxWithTitle: "Add after current page",
+                                            target: nil, action: nil)
+        afterCurrentCheckbox.state = .off
+
         let stack = NSStackView(views: [
             row("Count", countField, "pages"),
             row("Width", widthField, "pt"),
             row("Height", heightField, "pt"),
+            afterCurrentCheckbox,
         ])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 8
-        stack.frame = NSRect(x: 0, y: 0, width: 210, height: 90)
+        stack.frame = NSRect(x: 0, y: 0, width: 220, height: 120)
         alert.accessoryView = stack
         alert.window.initialFirstResponder = countField
 
@@ -592,53 +688,34 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
                          info: "Count must be 1–1000 and width/height must be positive numbers (in points).")
             return nil
         }
-        return (count, CGSize(width: min(width, 20000), height: min(height, 20000)))
+        return (count,
+                CGSize(width: min(width, 20000), height: min(height, 20000)),
+                afterCurrentCheckbox.state == .on)
     }
 
-    /// Prompts for a new page's width/height in PDF points. Returns nil on cancel.
-    private func promptForPageSize(defaultSize: CGSize) -> CGSize? {
-        let alert = NSAlert()
-        alert.messageText = "Add Page"
-        alert.informativeText = "Choose the size of the new page (in points; 72 pt = 1 inch)."
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
+    // MARK: - Page reordering
 
-        let widthField = NSTextField(string: String(format: "%g", defaultSize.width))
-        let heightField = NSTextField(string: String(format: "%g", defaultSize.height))
-        for field in [widthField, heightField] {
-            field.alignment = .right
-            field.widthAnchor.constraint(equalToConstant: 64).isActive = true
+    /// Moves the page at `from` so it ends up at index `to` (drag-and-drop in
+    /// the sidebar). Ink follows its page, and the move is undoable.
+    func movePage(from: Int, to: Int) {
+        guard let document = pdfView.document, from != to,
+              (0..<document.pageCount).contains(from),
+              (0..<document.pageCount).contains(to),
+              let page = document.page(at: from) else { return }
+
+        document.removePage(at: from)
+        document.insert(page, at: to)
+        store.movePage(from: from, to: to)
+        pdfView.layoutDocumentView()
+        canvas?.storeStructureDidChange()
+        pdfView.go(to: page)
+
+        window?.undoManager?.registerUndo(withTarget: self) { target in
+            target.movePage(from: to, to: from)
         }
-
-        func row(_ title: String, _ field: NSTextField) -> NSStackView {
-            let label = NSTextField(labelWithString: title)
-            label.alignment = .right
-            label.widthAnchor.constraint(equalToConstant: 52).isActive = true
-            let unit = NSTextField(labelWithString: "pt")
-            let stack = NSStackView(views: [label, field, unit])
-            stack.orientation = .horizontal
-            stack.spacing = 6
-            return stack
-        }
-
-        let stack = NSStackView(views: [row("Width", widthField), row("Height", heightField)])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        stack.frame = NSRect(x: 0, y: 0, width: 190, height: 54)
-        alert.accessoryView = stack
-        alert.window.initialFirstResponder = widthField
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-
-        let width = Double(widthField.stringValue.trimmingCharacters(in: .whitespaces))
-        let height = Double(heightField.stringValue.trimmingCharacters(in: .whitespaces))
-        guard let width, let height, width > 0, height > 0 else {
-            presentError(message: "Invalid page size",
-                         info: "Width and height must be positive numbers (in points).")
-            return nil
-        }
-        return CGSize(width: min(width, 20000), height: min(height, 20000))
+        window?.undoManager?.setActionName("Move Page")
+        saveDocumentAction(nil)
+        NSLog("PDFInk: moved page %d to %d", from, to)
     }
 
     // MARK: - Page deletion
@@ -890,7 +967,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         let docSelectors: Set<Selector> = [
             #selector(saveDocumentAction(_:)), #selector(exportFlattenedAction(_:)),
             #selector(zoomInAction(_:)), #selector(zoomOutAction(_:)), #selector(actualSizeAction(_:)),
-            #selector(addPageAction(_:)), #selector(addMultiplePagesAction(_:)), #selector(deletePageAction(_:)),
+            #selector(addPageAction(_:)), #selector(deletePageAction(_:)),
         ]
         if let sel = aSelector, docSelectors.contains(sel), pdfView.document == nil {
             return false

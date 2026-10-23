@@ -47,12 +47,19 @@ reinstall).
   next open.
 - **Whiteboards** (notebook mode): File ▸ New Whiteboard — Blank (⌘N), Grid,
   or Lined paper. Created as real PDFs in `~/Documents/PDFInk Whiteboards/`
-  and auto-saved notebook-style. Add Page (⌘⇧N) appends a matching page
-  (works on opened PDFs too, appending a blank page).
-- Page management: Add Page prompts for the new page's dimensions. In the page
-  sidebar, right-click a thumbnail for **Delete Page** (or select a page and
-  press Delete). Deletions remap ink to follow the pages and are undoable via
-  ⌘Z.
+  and auto-saved notebook-style. Add Pages (⌘⇧N) adds matching pages
+  (works on opened PDFs too, adding blank pages).
+- **Blank documents**: File ▸ Create a Blank Document… (⌘⌥N, also a button on
+  the start screen) asks for the page count and paper size (A4/A3/A5/Letter/
+  Legal or custom) and saves a new PDF in `~/Documents/PDFInk Documents/`.
+- Page management: Add Pages prompts for count and dimensions, with an
+  "Add after current page" checkbox (otherwise pages go after the last page).
+  In the page sidebar, drag a thumbnail to rearrange pages (ink follows its
+  page; undoable). Right-click a thumbnail for **Delete Page** (or select a
+  page and press Delete). Deletions remap ink to follow the pages and are
+  undoable via ⌘Z.
+- Text Select tool: the **T** button in the toolbar (or press T) lets you
+  select and copy PDF text.
 
 ## Architecture
 

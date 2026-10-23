@@ -235,6 +235,34 @@ func testPageRemovalRemapsStrokes() {
     expect(store.strokes(onPage: 2).first?.pageIndex == 2, "undo updates shifted pageIndex")
 }
 
+// MARK: - Page reordering remaps stroke page indices
+
+func testPageMoveRemapsStrokes() {
+    let store = StrokeStore()
+    func stroke(_ page: Int) -> Stroke {
+        Stroke(tool: .pen, color: StrokeColor(red: 0, green: 0, blue: 0), baseWidth: 2,
+               pageIndex: page, samples: [StrokeSample(point: CGPoint(x: 10, y: 10), pressure: 0.5)])
+    }
+    let a = stroke(0), b = stroke(1), c = stroke(2), d = stroke(3)
+    [a, b, c, d].forEach { store.add($0) }
+
+    store.movePage(from: 0, to: 2)          // order becomes b, c, a, d
+    expect(store.strokes(onPage: 0).map(\.id) == [b.id], "move forward: b now first")
+    expect(store.strokes(onPage: 1).map(\.id) == [c.id], "move forward: c now second")
+    expect(store.strokes(onPage: 2).map(\.id) == [a.id], "move forward: a lands at 2")
+    expect(store.strokes(onPage: 3).map(\.id) == [d.id], "move forward: d untouched")
+    expect(store.strokes(onPage: 2).first?.pageIndex == 2, "moved stroke's pageIndex updated")
+
+    store.movePage(from: 2, to: 0)          // inverse restores the original order
+    expect(store.strokes(onPage: 0).map(\.id) == [a.id], "undo restores a")
+    expect(store.strokes(onPage: 1).map(\.id) == [b.id], "undo restores b")
+    expect(store.strokes(onPage: 2).map(\.id) == [c.id], "undo restores c")
+
+    store.movePage(from: 3, to: 0)          // last page to the front
+    expect(store.strokes(onPage: 0).map(\.id) == [d.id], "last to first: d at 0")
+    expect(store.strokes(onPage: 3).map(\.id) == [c.id], "last to first: c shifted to 3")
+}
+
 // MARK: - Run
 
 testAffineTransformDerivation()
@@ -242,6 +270,7 @@ testPDFViewCoordinateRoundTrip()
 testAnnotationSerialization()
 testStoreAndGeometry()
 testPageRemovalRemapsStrokes()
+testPageMoveRemapsStrokes()
 if failures == 0 {
     print("ALL \(checks) CHECKS PASSED")
     exit(0)

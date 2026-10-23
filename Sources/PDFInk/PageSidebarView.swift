@@ -1,8 +1,8 @@
 import AppKit
 import PDFKit
 
-/// Sidebar page thumbnails with per-page context menus and Delete-key handling,
-/// layered on `PDFThumbnailView`.
+/// Sidebar page thumbnails with per-page context menus, Delete-key handling and
+/// drag-to-reorder, layered on `PDFThumbnailView`.
 ///
 /// `PDFThumbnailView` hosts a private `NSCollectionView` (`PDFIconCollectionView`)
 /// internally. That collection view is still an `NSCollectionView`, so its public
@@ -14,6 +14,24 @@ final class PageSidebarView: PDFThumbnailView {
     var pageMenuProvider: ((Int) -> NSMenu?)?
     /// Invoked when Delete/Backspace is pressed while a page is selected.
     var onDeleteKey: (() -> Void)?
+    /// Invoked when a thumbnail is dragged to a new spot. `from` is the page's
+    /// current index and `to` the index it should end up at.
+    var onMovePage: ((_ from: Int, _ to: Int) -> Void)?
+
+    // MARK: Drag-to-reorder state
+    private var dragMonitor: Any?
+    private var dragSourceIndex: Int?
+    private var dragStartPoint: CGPoint = .zero
+    private var isReordering = false
+    private var dropInsertionIndex: Int?
+    private let dropIndicator: NSView = {
+        let v = NSView()
+        v.wantsLayer = true
+        v.layer?.backgroundColor = NSColor.controlAccentColor.cgColor
+        v.layer?.cornerRadius = 1.5
+        v.isHidden = true
+        return v
+    }()
 
     /// Index of the currently selected page, if any. `PDFThumbnailView` keeps
     /// its selection in sync with the PDFView's current page.
@@ -24,6 +42,121 @@ final class PageSidebarView: PDFThumbnailView {
     }
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let monitor = dragMonitor {
+            NSEvent.removeMonitor(monitor)
+            dragMonitor = nil
+        }
+        guard window != nil else { return }
+        addSubview(dropIndicator)
+        dragMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
+            // Returning nil swallows the event; `?? event` would defeat that.
+            guard let self else { return event }
+            return self.handleReorderEvent(event)
+        }
+    }
+
+    deinit {
+        if let monitor = dragMonitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    // MARK: - Drag-to-reorder
+
+    /// Watches mouse events over the thumbnails. Clicks pass through untouched
+    /// (so selection keeps working); once a press on a thumbnail moves far
+    /// enough it turns into a reorder drag and the events are consumed.
+    private func handleReorderEvent(_ event: NSEvent) -> NSEvent? {
+        guard event.window === window else { return event }
+        let point = convert(event.locationInWindow, from: nil)
+
+        switch event.type {
+        case .leftMouseDown:
+            dragSourceIndex = nil
+            isReordering = false
+            guard bounds.contains(point), !isHiddenOrHasHiddenAncestor,
+                  (pdfView?.document?.pageCount ?? 0) > 1,
+                  let index = pageIndex(at: point) else { return event }
+            dragSourceIndex = index
+            dragStartPoint = point
+            return event
+
+        case .leftMouseDragged:
+            guard let source = dragSourceIndex else { return event }
+            if !isReordering {
+                guard hypot(point.x - dragStartPoint.x, point.y - dragStartPoint.y) > 6 else { return event }
+                isReordering = true
+                NSCursor.closedHand.push()
+            }
+            if let collection = Self.findCollectionView(in: self) {
+                _ = collection.autoscroll(with: event)
+            }
+            let insertion = insertionIndex(at: point)
+            dropInsertionIndex = insertion
+            updateDropIndicator(forInsertionAt: insertion, source: source)
+            return nil
+
+        case .leftMouseUp:
+            defer {
+                dragSourceIndex = nil
+                dropInsertionIndex = nil
+                dropIndicator.isHidden = true
+            }
+            guard isReordering, let source = dragSourceIndex else {
+                isReordering = false
+                return event
+            }
+            isReordering = false
+            NSCursor.pop()
+            if let insertion = dropInsertionIndex {
+                // `insertion` is a gap in the pre-move list; convert to the final index.
+                let final = insertion > source ? insertion - 1 : insertion
+                if final != source { onMovePage?(source, final) }
+            }
+            return nil
+
+        default:
+            return event
+        }
+    }
+
+    /// Which gap (0...pageCount) between thumbnails a point (in this view's
+    /// coordinates) is closest to.
+    private func insertionIndex(at point: CGPoint) -> Int {
+        guard let collection = Self.findCollectionView(in: self) else { return 0 }
+        let p = collection.convert(point, from: self)
+        let count = collection.numberOfItems(inSection: 0)
+        for i in 0..<count {
+            let frame = collection.frameForItem(at: i)
+            let isBefore = collection.isFlipped ? p.y < frame.midY : p.y > frame.midY
+            if isBefore { return i }
+        }
+        return count
+    }
+
+    private func updateDropIndicator(forInsertionAt insertion: Int, source: Int) {
+        guard let collection = Self.findCollectionView(in: self) else { return }
+        let count = collection.numberOfItems(inSection: 0)
+        guard count > 0 else { return }
+        // Dropping right where it already is would be a no-op; hide the line.
+        if insertion == source || insertion == source + 1 {
+            dropIndicator.isHidden = true
+            return
+        }
+        let edgeY: CGFloat
+        if insertion < count {
+            let f = collection.frameForItem(at: insertion)
+            edgeY = collection.isFlipped ? f.minY : f.maxY
+        } else {
+            let f = collection.frameForItem(at: count - 1)
+            edgeY = collection.isFlipped ? f.maxY : f.minY
+        }
+        let inSelf = convert(NSRect(x: 0, y: edgeY, width: collection.bounds.width, height: 0), from: collection)
+        dropIndicator.frame = NSRect(x: 8, y: inSelf.midY - 1.5, width: bounds.width - 16, height: 3)
+        dropIndicator.isHidden = false
+    }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)

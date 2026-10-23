@@ -164,6 +164,31 @@ public final class StrokeStore: Codable {
         onChange?(pageIndex)
     }
 
+    /// Moves the page at `from` so it ends up at index `to` (its final position),
+    /// shifting the pages in between and re-tagging their strokes so ink keeps
+    /// following its page. Inverse of `movePage(from: to, to: from)`.
+    public func movePage(from: Int, to: Int) {
+        guard from != to else { return }
+        func newIndex(_ page: Int) -> Int {
+            if page == from { return to }
+            if from < to, page > from, page <= to { return page - 1 }
+            if to < from, page >= to, page < from { return page + 1 }
+            return page
+        }
+        var rebuilt: [Int: [Stroke]] = [:]
+        for (page, pageStrokes) in strokesByPage {
+            let target = newIndex(page)
+            rebuilt[target] = pageStrokes.map { stroke in
+                var moved = stroke
+                moved.pageIndex = target
+                return moved
+            }
+        }
+        strokesByPage = rebuilt
+        generation &+= 1
+        onChange?(to)
+    }
+
     // MARK: - Persistence helpers
 
     public func jsonData() throws -> Data {
