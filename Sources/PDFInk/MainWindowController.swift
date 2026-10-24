@@ -130,6 +130,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         pdfView.addSubview(canvasView)
         canvasView.paletteColors = { [weak self] in self?.palette.colors ?? [] }
         canvasView.onColorShortcut = { [weak self] slot in self?.handleColorShortcut(slot) }
+        canvasView.onImageToolSelected = { [weak self] in self?.presentImageImport() }
         canvas = canvasView
 
         NSLayoutConstraint.activate([
@@ -167,7 +168,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
 
     fileprivate func makeToolsItem() -> NSToolbarItem {
         let segment = NSSegmentedControl(
-            labels: ["✏️ Pen", "🖍 Highlight", "◻️ Erase", "◌ Lasso", ""],
+            labels: ["✏️ Pen", "🖍 Highlight", "◻️ Erase", "◌ Lasso", "", ""],
             trackingMode: .selectOne,
             target: self,
             action: #selector(toolSegmentChanged(_:)))
@@ -175,6 +176,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         segment.setImageScaling(.scaleProportionallyDown, forSegment: 4)
         segment.setToolTip("Text Select (T)", forSegment: 4)
         segment.setWidth(36, forSegment: 4)
+        // Image import: Apple's native SF Symbol image icon (template, follows tint/selection).
+        let photo = NSImage(systemSymbolName: "photo", accessibilityDescription: "Import Image")
+        segment.setImage(photo, forSegment: 5)
+        segment.setImageScaling(.scaleProportionallyDown, forSegment: 5)
+        segment.setToolTip("Import Image (I)", forSegment: 5)
+        segment.setWidth(36, forSegment: 5)
         segment.selectedSegment = 0
         toolSegment = segment
         let item = NSToolbarItem(itemIdentifier: ToolbarID.tools)
@@ -306,6 +313,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         case .highlighter: toolIndex = 1
         case .eraser: toolIndex = 2
         case .lasso: toolIndex = 3
+        case .image: toolIndex = 5
         }
         if toolState.isTextSelectionEnabled { toolIndex = 4 }   // Text Select ("T")
         toolSegment?.selectedSegment = toolIndex
@@ -330,6 +338,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     @objc private func toolSegmentChanged(_ sender: NSSegmentedControl) {
         if sender.selectedSegment == 4 {            // Text Select
             toolState.isTextSelectionEnabled = true
+            return
+        }
+        if sender.selectedSegment == 5 {            // Image import
+            if toolState.tool == .image { presentImageImport() } else { toolState.tool = .image }
             return
         }
         let tools: [Tool] = [.pen, .highlighter, .eraser, .lasso]
@@ -1182,6 +1194,40 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     @objc func selectHighlighterAction(_ sender: Any?) { toolState.tool = .highlighter }
     @objc func selectEraserAction(_ sender: Any?) { toolState.tool = .eraser }
     @objc func selectLassoAction(_ sender: Any?) { toolState.tool = .lasso }
+    @objc func selectImageAction(_ sender: Any?) {
+        if toolState.tool == .image { presentImageImport() } else { toolState.tool = .image }
+    }
+
+    private var imagePanelOpen = false
+
+    /// Shows the image picker. A picked image is placed and selected (the tool
+    /// switches to the lasso so it can be moved/scaled); cancelling returns to
+    /// the previous drawing tool.
+    func presentImageImport() {
+        guard !imagePanelOpen, let window else { return }
+        guard pdfView.document != nil else {
+            NSSound.beep()
+            toolState.tool = toolState.lastDrawingTool
+            return
+        }
+        imagePanelOpen = true
+        let panel = NSOpenPanel()
+        panel.title = "Import Image"
+        panel.prompt = "Import"
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        // Deferred a tick so the toolbar/shortcut event that triggered this finishes first.
+        DispatchQueue.main.async { [weak self] in
+            panel.beginSheetModal(for: window) { [weak self] response in
+                guard let self else { return }
+                self.imagePanelOpen = false
+                if response == .OK, let url = panel.url, self.canvas?.importImage(from: url) == true { return }
+                if response == .OK { NSSound.beep() }
+                if self.toolState.tool == .image { self.toolState.tool = self.toolState.lastDrawingTool }
+            }
+        }
+    }
 
     @objc func undo(_ sender: Any?) { window?.undoManager?.undo() }
     @objc func redo(_ sender: Any?) { window?.undoManager?.redo() }

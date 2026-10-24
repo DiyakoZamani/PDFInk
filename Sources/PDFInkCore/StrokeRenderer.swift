@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import ImageIO
 
 /// Renders strokes into a CGContext whose coordinate system is PDF page space
 /// (or view space with a page→view transform already concatenated).
@@ -8,8 +9,36 @@ public enum StrokeRenderer {
 
     public static let highlighterAlpha: CGFloat = 0.4
 
+    // Decoded images, keyed by item id, so dragging/scaling doesn't re-decode every frame.
+    private static let imageCache = NSCache<NSString, CGImage>()
+
+    /// Decodes (and caches) the pixels of an `.image` item.
+    public static func cgImage(for stroke: Stroke) -> CGImage? {
+        let key = stroke.id.uuidString as NSString
+        if let cached = imageCache.object(forKey: key) { return cached }
+        guard let data = stroke.imageData,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        imageCache.setObject(image, forKey: key)
+        return image
+    }
+
+    /// Draws the image into the quad described by the item's four corner samples.
+    private static func drawImage(_ stroke: Stroke, in ctx: CGContext) {
+        guard stroke.samples.count == 4, let image = cgImage(for: stroke) else { return }
+        let c = stroke.samples.map(\.point)          // BL, BR, TR, TL
+        // Unit square → quad (handles move, uniform scale and rotation).
+        let t = StrokeGeometry.affineTransform(mappingOrigin: c[0], unitX: c[1], unitY: c[3])
+        ctx.saveGState()
+        ctx.concatenate(t)
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: 1, height: 1))
+        ctx.restoreGState()
+    }
+
     public static func draw(_ stroke: Stroke, in ctx: CGContext) {
         guard !stroke.samples.isEmpty else { return }
+        if stroke.tool == .image { drawImage(stroke, in: ctx); return }
         ctx.saveGState()
         defer { ctx.restoreGState() }
         ctx.setLineCap(.round)

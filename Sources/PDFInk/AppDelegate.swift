@@ -191,6 +191,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toolsMenu.addItem(withTitle: "Highlighter", action: #selector(MainWindowController.selectHighlighterAction(_:)), keyEquivalent: "2")
         toolsMenu.addItem(withTitle: "Eraser", action: #selector(MainWindowController.selectEraserAction(_:)), keyEquivalent: "3")
         toolsMenu.addItem(withTitle: "Lasso Select", action: #selector(MainWindowController.selectLassoAction(_:)), keyEquivalent: "4")
+        toolsMenu.addItem(withTitle: "Import Image…", action: #selector(MainWindowController.selectImageAction(_:)), keyEquivalent: "i")
         toolsMenu.addItem(withTitle: "Text Select", action: #selector(MainWindowController.selectTextSelectionAction(_:)), keyEquivalent: "t")
 
         NSApp.mainMenu = mainMenu

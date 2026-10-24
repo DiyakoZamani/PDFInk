@@ -2,6 +2,7 @@ import AppKit
 import PDFKit
 import PDFInkCore
 import UniformTypeIdentifiers
+import ImageIO
 
 /// Reads PDF file URLs from Finder drags without relying on pasteboard
 /// content-type filtering, which can reject otherwise valid file URL drags.
@@ -47,6 +48,10 @@ final class DrawingCanvasView: NSView {
     /// Called when a color shortcut key (1–5) is pressed; the argument is the
     /// 0-based palette slot (left → right).
     var onColorShortcut: ((Int) -> Void)?
+
+    /// Called when the Image tool becomes active (toolbar, menu or the I key);
+    /// the window controller responds by showing the image picker.
+    var onImageToolSelected: (() -> Void)?
 
     /// The palette's current colors (left → right), shown in the color bar that
     /// floats above a lasso selection.
@@ -219,6 +224,7 @@ final class DrawingCanvasView: NSView {
 
     func toolStateDidChange() {
         if toolState.tool != .lasso, !selectedIDs.isEmpty { clearSelection() }
+        if toolState.tool == .image { onImageToolSelected?() }
         window?.invalidateCursorRects(for: self)
         activeCursor.set()
     }
@@ -405,6 +411,8 @@ final class DrawingCanvasView: NSView {
             erase(at: viewPoint, page: page, pageIndex: pageIndex)
         case .lasso:
             beginLasso(at: viewPoint, page: page, pageIndex: pageIndex)
+        case .image:
+            return          // the picker is already showing; nothing to draw
         case .pen, .highlighter:
             activePage = page
             activePageIndex = pageIndex
@@ -499,7 +507,9 @@ final class DrawingCanvasView: NSView {
         let pagePoint = viewToPage(viewPoint, page: page)
         // ~8 screen points of tolerance, expressed in page space.
         let tolerance = 8.0 / max(pdfView?.scaleFactor ?? 1, 0.01)
-        while let hit = store.hitTest(point: pagePoint, pageIndex: pageIndex, tolerance: tolerance) {
+        // Images are removed via lasso ▸ Delete, so ink scrubbed over a picture leaves it intact.
+        while let hit = store.hitTest(point: pagePoint, pageIndex: pageIndex,
+                                      tolerance: tolerance, includeImages: false) {
             performRemove(strokeID: hit.id, pageIndex: pageIndex, actionName: "Erase Stroke")
         }
     }
@@ -608,7 +618,7 @@ final class DrawingCanvasView: NSView {
         return nil
     }
 
-    /// Z pen, X eraser, C highlighter, V lasso, 1–5 palette colors (left → right).
+    /// Z pen, X eraser, C highlighter, V lasso, I image, 1–5 palette colors (left → right).
     /// With a lasso selection: Delete/Backspace/X delete it, Esc deselects.
     private func handleToolShortcut(_ event: NSEvent) -> NSEvent? {
         guard event.type == .keyDown else { return event }
@@ -619,6 +629,7 @@ final class DrawingCanvasView: NSView {
         case 7: tool = .eraser         // X
         case 8: tool = .highlighter    // C
         case 9: tool = .lasso          // V
+        case 34: tool = .image         // I
         case 18: tool = nil; colorSlot = 0   // 1
         case 19: tool = nil; colorSlot = 1   // 2
         case 20: tool = nil; colorSlot = 2   // 3
@@ -726,18 +737,7 @@ final class DrawingCanvasView: NSView {
     }
 
     private static func polygonContains(_ poly: [CGPoint], _ p: CGPoint) -> Bool {
-        guard poly.count >= 3 else { return false }
-        var inside = false
-        var j = poly.count - 1
-        for i in 0..<poly.count {
-            let a = poly[i], b = poly[j]
-            if (a.y > p.y) != (b.y > p.y),
-               p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
-                inside.toggle()
-            }
-            j = i
-        }
-        return inside
+        StrokeGeometry.polygon(poly, contains: p)
     }
 
     private func lassoHit(_ p: CGPoint, page: PDFPage) -> LassoDrag? {
@@ -835,10 +835,78 @@ final class DrawingCanvasView: NSView {
         let chosen = store.strokes(onPage: pageIndex).filter { stroke in
             guard !stroke.samples.isEmpty else { return false }
             let inside = stroke.samples.filter { Self.polygonContains(polygon, $0.point) }.count
+            if stroke.tool == .image {
+                // An image counts when its center or at least half its corners are in the loop.
+                let n = CGFloat(stroke.samples.count)
+                let center = CGPoint(x: stroke.samples.map(\.point.x).reduce(0, +) / n,
+                                     y: stroke.samples.map(\.point.y).reduce(0, +) / n)
+                return Self.polygonContains(polygon, center) || Double(inside) / Double(stroke.samples.count) >= 0.5
+            }
             return Double(inside) / Double(stroke.samples.count) >= 0.5      // selection threshold
         }
         selectedIDs = Set(chosen.map(\.id))
         selectionPageIndex = chosen.isEmpty ? -1 : pageIndex
+    }
+
+    // MARK: - Image import
+
+    /// Longest edge, in pixels, an imported image is downscaled to (keeps the
+    /// autosave draft and the saved PDF annotation a sane size).
+    private static let maxImportPixels: CGFloat = 2048
+
+    /// Places the image at `url` on the page in view, centered in the visible
+    /// area, then switches to the lasso with the image selected so it can be
+    /// moved, scaled (corner handles) or rotated straight away. One undo step.
+    @discardableResult
+    func importImage(from url: URL) -> Bool {
+        guard let pdfView, let document = pdfView.document,
+              let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return false }
+
+        // Page under the middle of the visible area, else the current page.
+        let viewCenter = CGPoint(x: bounds.midX, y: bounds.midY)
+        let located = page(at: viewCenter)
+        guard let page = located?.0 ?? pdfView.currentPage ?? document.page(at: 0) else { return false }
+        let pageIndex = document.index(for: page)
+
+        // Downscale huge images and re-encode as PNG (keeps transparency).
+        let longest = CGFloat(max(decoded.width, decoded.height))
+        var cgImage = decoded
+        if longest > Self.maxImportPixels {
+            let f = Self.maxImportPixels / longest
+            let w = max(Int((CGFloat(decoded.width) * f).rounded()), 1)
+            let h = max(Int((CGFloat(decoded.height) * f).rounded()), 1)
+            if let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                   space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+                ctx.interpolationQuality = .high
+                ctx.draw(decoded, in: CGRect(x: 0, y: 0, width: w, height: h))
+                if let scaled = ctx.makeImage() { cgImage = scaled }
+            }
+        }
+        guard let png = NSBitmapImageRep(cgImage: cgImage).representation(using: .png, properties: [:]) else {
+            return false
+        }
+
+        // Natural size (1 px = 1 pt), shrunk to fit within 60% of the page.
+        let pageBounds = page.bounds(for: pdfView.displayBox)
+        let natural = CGSize(width: cgImage.width, height: cgImage.height)
+        let fit = min(1, 0.6 * pageBounds.width / natural.width, 0.6 * pageBounds.height / natural.height)
+        let size = CGSize(width: natural.width * fit, height: natural.height * fit)
+
+        var center = located != nil ? viewToPage(viewCenter, page: page)
+                                    : CGPoint(x: pageBounds.midX, y: pageBounds.midY)
+        center.x = min(max(center.x, pageBounds.minX + size.width / 2), pageBounds.maxX - size.width / 2)
+        center.y = min(max(center.y, pageBounds.minY + size.height / 2), pageBounds.maxY - size.height / 2)
+
+        let item = Stroke.image(data: png, pageIndex: pageIndex, center: center, size: size)
+        toolState.tool = .lasso                      // clears any old selection via toolStateDidChange
+        clearSelection()
+        performAdd(item, actionName: "Import Image")
+        selectedIDs = [item.id]
+        selectionPageIndex = pageIndex
+        needsDisplay = true
+        return true
     }
 
     // MARK: - Selection color bar
@@ -854,7 +922,7 @@ final class DrawingCanvasView: NSView {
     /// Palette slot matching the selection's color: only when every selected
     /// stroke has the same color and that color is one of the palette colors.
     private var selectionPaletteSlot: Int? {
-        let strokes = selectedStrokes
+        let strokes = selectedStrokes.filter { $0.tool != .image }
         guard let first = strokes.first,
               strokes.allSatisfy({ Self.sameColor($0.color, first.color) }) else { return nil }
         return paletteColors().firstIndex { Self.sameColor($0, first.color) }
@@ -864,6 +932,8 @@ final class DrawingCanvasView: NSView {
     /// (above the rotate handle). If there's no room above it goes below, and it
     /// is always kept inside the canvas.
     private func colorBarRect(for g: SelectionGeometry) -> CGRect? {
+        // Images have no ink color: a selection of only images gets no color bar.
+        guard selectedStrokes.contains(where: { $0.tool != .image }) else { return nil }
         let count = paletteColors().count
         guard count > 0 else { return nil }
         let n = CGFloat(count)
@@ -904,9 +974,9 @@ final class DrawingCanvasView: NSView {
         return true   // clicks on the bar's padding are swallowed too
     }
 
-    /// Gives every selected stroke `color` as one undoable step.
+    /// Gives every selected stroke `color` as one undoable step. Selected images are left untouched.
     private func recolorSelection(to color: StrokeColor) {
-        let old = selectedStrokes
+        let old = selectedStrokes.filter { $0.tool != .image }
         guard !old.isEmpty else { return }
         let new = old.map { stroke -> Stroke in
             var recolored = stroke

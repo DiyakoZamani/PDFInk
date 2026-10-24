@@ -7,6 +7,11 @@ public enum Tool: String, Codable, CaseIterable, Sendable {
     case highlighter
     case eraser
     case lasso // stubbed for v1
+    /// An imported raster image. Stored as a `Stroke` so selection, transforms,
+    /// z-order, undo, autosave and page remapping all work unchanged: `samples`
+    /// holds the image's four corners in page space (bottom-left, bottom-right,
+    /// top-right, top-left) and `imageData` holds the encoded pixels.
+    case image
 }
 
 /// A single input sample: a point in PDF page space plus stylus pressure.
@@ -49,6 +54,8 @@ public struct Stroke: Codable, Equatable, Identifiable, Sendable {
     public var samples: [StrokeSample]
     /// Highlighter opacity 0...1. nil = legacy default (StrokeRenderer.highlighterAlpha). Unused by the pen.
     public var opacity: CGFloat?
+    /// Encoded image bytes (PNG) for `.image` strokes; nil for every other tool.
+    public var imageData: Data?
 
     public init(id: UUID = UUID(),
                 tool: Tool,
@@ -56,7 +63,8 @@ public struct Stroke: Codable, Equatable, Identifiable, Sendable {
                 baseWidth: CGFloat,
                 pageIndex: Int,
                 samples: [StrokeSample] = [],
-                opacity: CGFloat? = nil) {
+                opacity: CGFloat? = nil,
+                imageData: Data? = nil) {
         self.id = id
         self.tool = tool
         self.color = color
@@ -64,6 +72,21 @@ public struct Stroke: Codable, Equatable, Identifiable, Sendable {
         self.pageIndex = pageIndex
         self.samples = samples
         self.opacity = opacity
+        self.imageData = imageData
+    }
+
+    /// Builds an image item from its page-space center, size (points) and rotation (radians).
+    public static func image(data: Data, pageIndex: Int, center: CGPoint,
+                             size: CGSize, rotation: CGFloat = 0) -> Stroke {
+        let t = CGAffineTransform(translationX: center.x, y: center.y).rotated(by: rotation)
+        let hw = size.width / 2, hh = size.height / 2
+        let corners = [CGPoint(x: -hw, y: -hh), CGPoint(x: hw, y: -hh),
+                       CGPoint(x: hw, y: hh), CGPoint(x: -hw, y: hh)]
+            .map { $0.applying(t) }
+        return Stroke(tool: .image, color: StrokeColor(red: 0, green: 0, blue: 0),
+                      baseWidth: 0, pageIndex: pageIndex,
+                      samples: corners.map { StrokeSample(point: $0, pressure: 1) },
+                      imageData: data)
     }
 
     /// Returns a copy with all sample points transformed. `widthScale` scales the pen width too.
@@ -83,7 +106,7 @@ public struct Stroke: Codable, Equatable, Identifiable, Sendable {
             minX = min(minX, s.point.x); maxX = max(maxX, s.point.x)
             minY = min(minY, s.point.y); maxY = max(maxY, s.point.y)
         }
-        let pad = StrokeGeometry.width(forPressure: 1.0, baseWidth: baseWidth, tool: tool)
+        let pad = tool == .image ? 0 : StrokeGeometry.width(forPressure: 1.0, baseWidth: baseWidth, tool: tool)
         return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
             .insetBy(dx: -pad, dy: -pad)
     }

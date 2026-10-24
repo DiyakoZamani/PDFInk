@@ -67,6 +67,14 @@ reinstall).
   number again (or the number of the active color) steps forward through the
   palette and wraps around, e.g. 3, 3, 3, 3 → colors 3, 4, 5, 1. Palette
   circles have a white outline so dark colors show on the dark toolbar.
+- **Image import**: press **I** (or click the photo icon in the toolbar, or
+  Tools ▸ Import Image…) and pick an image. It lands centered on the page in
+  view and is selected with the lasso, so you can immediately drag it, scale it
+  with the corner handles, or rotate it. Lasso-select or tap an image any time
+  to transform or delete it. Images are not affected by the selection color
+  bar, and the eraser leaves them alone (delete them with the lasso). Images
+  are autosaved, saved into the PDF as stamp annotations that PDFInk re-opens
+  as editable images, and burned in by Export Flattened PDF.
 - Lasso selection: a dark bar with the five palette colors floats above the
   selection (and follows it while you move/scale/rotate). Click a color to
   recolor every selected stroke (undoable); the ring marks the shared color
@@ -77,6 +85,7 @@ reinstall).
 | Component | File | Role |
 |---|---|---|
 | `DrawingCanvasView` | `Sources/PDFInk/` | Input (mouse/tablet), live rendering, per-page bitmap caches |
+| `Stroke` (`.image`) | `Sources/PDFInkCore/` | Imported images are strokes whose 4 samples are the image corners |
 | `StrokeStore` | `Sources/PDFInkCore/` | Model: strokes per page in page space, hit-testing, JSON |
 | `StrokeGeometry` | `Sources/PDFInkCore/` | Pressure→width, Catmull-Rom, page↔view affine transforms |
 | `StrokeRenderer` | `Sources/PDFInkCore/` | Stroke → CGContext (canvas cache + flattened export) |

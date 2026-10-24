@@ -94,6 +94,15 @@ public enum StrokeGeometry {
     public static func stroke(_ stroke: Stroke, contains point: CGPoint, tolerance: CGFloat) -> Bool {
         let pts = stroke.samples.map(\.point)
         guard !pts.isEmpty else { return false }
+        if stroke.tool == .image {
+            // Images are hit anywhere inside their (possibly rotated) quad, or near its edge.
+            if polygon(pts, contains: point) { return true }
+            let tol2 = tolerance * tolerance
+            for i in 0..<pts.count where squaredDistanceToSegment(point, pts[i], pts[(i + 1) % pts.count]) <= tol2 {
+                return true
+            }
+            return false
+        }
         let tol2 = tolerance * tolerance
         if pts.count == 1 {
             return squaredDistance(point, pts[0]) <= tol2
@@ -104,6 +113,22 @@ public enum StrokeGeometry {
             }
         }
         return false
+    }
+
+    /// Even-odd point-in-polygon test.
+    public static func polygon(_ poly: [CGPoint], contains p: CGPoint) -> Bool {
+        guard poly.count >= 3 else { return false }
+        var inside = false
+        var j = poly.count - 1
+        for i in 0..<poly.count {
+            let a = poly[i], b = poly[j]
+            if (a.y > p.y) != (b.y > p.y),
+               p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+                inside.toggle()
+            }
+            j = i
+        }
+        return inside
     }
 
     public static func squaredDistance(_ a: CGPoint, _ b: CGPoint) -> CGFloat {

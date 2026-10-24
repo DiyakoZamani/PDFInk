@@ -14,7 +14,31 @@ public enum AnnotationSerializer {
 
     // MARK: - Stroke → PDFAnnotation
 
+    /// Stamp annotation for an imported image. It stashes the same JSON payload as
+    /// ink so PDFInk can re-open it as an editable image, and draws the picture
+    /// itself for PDFKit-based viewers.
+    final class ImageStampAnnotation: PDFAnnotation {
+        var item: Stroke?
+        override func draw(with box: PDFDisplayBox, in context: CGContext) {
+            guard let item else { return }
+            StrokeRenderer.draw(item, in: context)
+        }
+    }
+
+    private static func imageAnnotation(for stroke: Stroke) -> PDFAnnotation {
+        let annotation = ImageStampAnnotation(bounds: stroke.pageBounds, forType: .stamp, withProperties: nil)
+        annotation.item = stroke
+        annotation.userName = annotationTitle
+        annotation.contents = nil
+        if let payload = try? JSONEncoder().encode(stroke) {
+            annotation.setValue(payload.base64EncodedString(),
+                                forAnnotationKey: PDFAnnotationKey(rawValue: strokePayloadKey))
+        }
+        return annotation
+    }
+
     public static func annotation(for stroke: Stroke) -> PDFAnnotation {
+        if stroke.tool == .image { return imageAnnotation(for: stroke) }
         let bounds = stroke.pageBounds
         let annotation = PDFAnnotation(bounds: bounds, forType: .ink, withProperties: nil)
         annotation.userName = annotationTitle

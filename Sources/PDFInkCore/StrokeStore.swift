@@ -49,8 +49,12 @@ public final class StrokeStore: Codable {
     }
 
     /// Topmost stroke on a page within `tolerance` (page points) of `point`, if any.
-    public func hitTest(point: CGPoint, pageIndex: Int, tolerance: CGFloat) -> Stroke? {
+    /// `includeImages: false` ignores imported images (the stroke eraser uses this
+    /// so scrubbing over ink drawn on a picture doesn't delete the picture).
+    public func hitTest(point: CGPoint, pageIndex: Int, tolerance: CGFloat,
+                        includeImages: Bool = true) -> Stroke? {
         for stroke in strokes(onPage: pageIndex).reversed() {
+            if stroke.tool == .image, !includeImages { continue }
             guard stroke.pageBounds.insetBy(dx: -tolerance, dy: -tolerance).contains(point) else { continue }
             if StrokeGeometry.stroke(stroke, contains: point, tolerance: tolerance) {
                 return stroke

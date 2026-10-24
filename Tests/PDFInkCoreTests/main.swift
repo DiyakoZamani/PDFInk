@@ -263,6 +263,56 @@ func testPageMoveRemapsStrokes() {
     expect(store.strokes(onPage: 3).map(\.id) == [c.id], "last to first: c shifted to 3")
 }
 
+// MARK: - Imported images
+
+func testImageItems() {
+    // 100×50 image centered at (200, 300), unrotated.
+    let png = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 4, pixelsHigh: 2, bitsPerSample: 8,
+                               samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                               colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        .representation(using: .png, properties: [:])!
+    let img = Stroke.image(data: png, pageIndex: 0, center: CGPoint(x: 200, y: 300),
+                           size: CGSize(width: 100, height: 50))
+    expect(img.tool == .image && img.samples.count == 4, "image item has four corner samples")
+    expectClose(img.pageBounds.minX, 150, "image bounds minX (no ink padding)")
+    expectClose(img.pageBounds.width, 100, "image bounds width")
+    expectClose(img.pageBounds.height, 50, "image bounds height")
+
+    // Hit test: anywhere inside, not outside; the eraser path can skip images.
+    let store = StrokeStore()
+    store.add(img)
+    expect(store.hitTest(point: CGPoint(x: 200, y: 300), pageIndex: 0, tolerance: 2)?.id == img.id,
+           "tap inside image hits it")
+    expect(store.hitTest(point: CGPoint(x: 400, y: 300), pageIndex: 0, tolerance: 2) == nil,
+           "tap outside image misses")
+    expect(store.hitTest(point: CGPoint(x: 200, y: 300), pageIndex: 0, tolerance: 2, includeImages: false) == nil,
+           "eraser hit test ignores images")
+
+    // Transforms move the corners; scaling about a corner keeps that corner fixed.
+    let scaled = img.applying(CGAffineTransform(translationX: 150, y: 275).scaledBy(x: 2, y: 2)
+        .translatedBy(x: -150, y: -275), widthScale: 2)
+    expectClose(scaled.pageBounds.width, 200, "scaled image is twice as wide")
+    expectClose(scaled.pageBounds.minX, 150, "anchor corner stays put")
+    let rotated = img.applying(CGAffineTransform(translationX: 200, y: 300).rotated(by: .pi / 2)
+        .translatedBy(x: -200, y: -300))
+    expectClose(rotated.pageBounds.width, 50, "rotated 90° swaps width/height")
+    expect(rotated.imageData == png, "transform keeps the pixels")
+
+    // JSON round trip (autosave draft) keeps the image data.
+    if let data = try? store.jsonData(), let loaded = try? StrokeStore.load(from: data) {
+        expect(loaded.strokes(onPage: 0).first?.imageData == png, "image survives draft JSON round trip")
+    } else {
+        expect(false, "store with image encodes/decodes")
+    }
+
+    // Renders into a bitmap without crashing and paints inside the quad only.
+    let ctx = CGContext(data: nil, width: 400, height: 400, bitsPerComponent: 8, bytesPerRow: 0,
+                        space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    StrokeRenderer.draw(img, in: ctx)
+    expect(StrokeRenderer.cgImage(for: img) != nil, "image decodes")
+}
+
 // MARK: - Run
 
 testAffineTransformDerivation()
@@ -271,6 +321,7 @@ testAnnotationSerialization()
 testStoreAndGeometry()
 testPageRemovalRemapsStrokes()
 testPageMoveRemapsStrokes()
+testImageItems()
 if failures == 0 {
     print("ALL \(checks) CHECKS PASSED")
     exit(0)

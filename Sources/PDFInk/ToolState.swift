@@ -48,7 +48,7 @@ final class ToolState {
     var tool: Tool = .pen {
         didSet {
             isTextSelectionEnabled = false
-            if oldValue != tool, oldValue != .eraser { lastDrawingTool = oldValue }
+            if oldValue != tool, oldValue != .eraser, oldValue != .image { lastDrawingTool = oldValue }
             if !applyingStylusSwitch { eraserSetByStylus = false }   // user picked a tool manually
             onChange?()
         }
