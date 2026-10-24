@@ -29,8 +29,9 @@ final class ColorSwatchButton: NSView {
         let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 3, dy: 3))
         NSColor(srgbRed: color.red, green: color.green, blue: color.blue, alpha: 1).setFill()
         circle.fill()
-        NSColor.separatorColor.setStroke()
-        circle.lineWidth = 0.75
+        // White outline so dark colors stay visible on the dark toolbar.
+        NSColor.white.withAlphaComponent(0.95).setStroke()
+        circle.lineWidth = 1.5
         circle.stroke()
 
         if isActive {

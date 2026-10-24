@@ -62,7 +62,15 @@ reinstall).
   (or select pages and press Delete). Deletions remap ink to follow the pages
   and are undoable via ⌘Z.
 - Text Select tool: the **T** button in the toolbar (or press T) lets you
-  select and copy PDF text.
+  select PDF text, then copy it with ⌘C (Edit ▸ Copy).
+- Colors: keys **1–5** pick the palette colors from left to right. Pressing a
+  number again (or the number of the active color) steps forward through the
+  palette and wraps around, e.g. 3, 3, 3, 3 → colors 3, 4, 5, 1. Palette
+  circles have a white outline so dark colors show on the dark toolbar.
+- Lasso selection: a dark bar with the five palette colors floats above the
+  selection (and follows it while you move/scale/rotate). Click a color to
+  recolor every selected stroke (undoable); the ring marks the shared color
+  when all selected strokes have the same palette color.
 
 ## Architecture
 

@@ -128,6 +128,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         // input through PDFView's page geometry.
         let canvasView = DrawingCanvasView(pdfView: pdfView, store: store, toolState: toolState)
         pdfView.addSubview(canvasView)
+        canvasView.paletteColors = { [weak self] in self?.palette.colors ?? [] }
+        canvasView.onColorShortcut = { [weak self] slot in self?.handleColorShortcut(slot) }
         canvas = canvasView
 
         NSLayoutConstraint.activate([
@@ -224,6 +226,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         palette.select(slot: slot)
         toolState.color = palette.colors[palette.activeSlot]
         swatchBar?.reload(from: palette)
+    }
+
+    /// The key (0-based slot) pressed last and the slot it ended up selecting,
+    /// used to tell "press the same number again" from "jump to this number".
+    private var lastColorShortcut: (key: Int, result: Int)?
+
+    /// Keys 1–5 (left → right). Pressing a number jumps to that color; pressing
+    /// it again steps forward through the palette, wrapping after the last color:
+    /// from 1, `3` → 3, `3` → 4, `3` → 5, `3` → 1, `3` → 2 …
+    /// Pressing the number of the color that is already active also steps forward.
+    private func handleColorShortcut(_ key: Int) {
+        guard palette.colors.indices.contains(key) else { return }
+        let active = palette.activeSlot
+        let repeatedKey = lastColorShortcut?.key == key && lastColorShortcut?.result == active
+        let target = (key == active || repeatedKey) ? (active + 1) % ColorPalette.slotCount : key
+        lastColorShortcut = (key, target)
+        selectColorSlot(target)
+        // If the editor is open, make it follow the newly selected swatch.
+        if editingSlot != nil { openEditor(forSlot: target) }
     }
 
     fileprivate func makeWidthItem() -> NSToolbarItem {
@@ -382,6 +403,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         if slot == palette.activeSlot { toolState.color = c }
         updateHexField(to: c)
         swatchBar?.reload(from: palette)
+        canvas?.paletteDidChange()
     }
 
     private func clearColorPanelTarget() {
@@ -1164,8 +1186,28 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     @objc func undo(_ sender: Any?) { window?.undoManager?.undo() }
     @objc func redo(_ sender: Any?) { window?.undoManager?.redo() }
 
+    /// ⌘C / Edit ▸ Copy: copies the text selected with the Text Select tool.
+    /// Text fields (hex field, dialogs) handle their own `copy:` before this is
+    /// reached, because the menu item has no fixed target.
+    @objc(copy:) func copySelectedText(_ sender: Any?) {
+        guard let selection = pdfView.currentSelection,
+              let text = selection.string, !text.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        if let attributed = selection.attributedString, attributed.length > 0 {
+            pasteboard.writeObjects([attributed])   // rich text + plain string
+        } else {
+            pasteboard.setString(text, forType: .string)
+        }
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
+        case #selector(copySelectedText(_:)):
+            return !(pdfView.currentSelection?.string ?? "").isEmpty
         case #selector(undo(_:)): return window?.undoManager?.canUndo ?? false
         case #selector(redo(_:)): return window?.undoManager?.canRedo ?? false
         default: return true

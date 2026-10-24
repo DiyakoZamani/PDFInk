@@ -168,6 +168,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
         let redoItem = editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "z")
         redoItem.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Copy",
+                         action: #selector(MainWindowController.copySelectedText(_:)),
+                         keyEquivalent: "c")
 
         // View menu
         let viewMenuItem = NSMenuItem()

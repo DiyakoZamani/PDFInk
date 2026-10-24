@@ -44,6 +44,14 @@ final class DrawingCanvasView: NSView {
     /// Called when a PDF is dropped onto the drawing canvas.
     var onPDFDropped: ((URL) -> Void)?
 
+    /// Called when a color shortcut key (1–5) is pressed; the argument is the
+    /// 0-based palette slot (left → right).
+    var onColorShortcut: ((Int) -> Void)?
+
+    /// The palette's current colors (left → right), shown in the color bar that
+    /// floats above a lasso selection.
+    var paletteColors: () -> [StrokeColor] = { [] }
+
     // MARK: Live stroke state (page space)
     private var activeSamples: [StrokeSample] = []
     private var activePage: PDFPage?
@@ -202,6 +210,11 @@ final class DrawingCanvasView: NSView {
     func storeStructureDidChange() {
         clearSelection()
         invalidateAllCaches()
+    }
+
+    /// The palette changed (a slot was edited): refresh the selection's color bar.
+    func paletteDidChange() {
+        if !selectedIDs.isEmpty { needsDisplay = true }
     }
 
     func toolStateDidChange() {
@@ -381,6 +394,9 @@ final class DrawingCanvasView: NSView {
         reassertCursor()
         guard pdfView?.document != nil else { return }
         let viewPoint = viewPoint(for: event)
+        // Clicks on the selection's color bar recolor the selected strokes.
+        if toolState.tool == .lasso, !stylusIsEraserEnd, lassoDrag == nil,
+           handleColorBarClick(at: viewPoint) { return }
         guard let (page, pageIndex) = page(at: viewPoint) else { return }
 
         let effectiveTool = stylusIsEraserEnd ? .eraser : toolState.tool
@@ -592,15 +608,22 @@ final class DrawingCanvasView: NSView {
         return nil
     }
 
-    /// Z pen, X eraser, C highlighter, V lasso. With a lasso selection: Delete/Backspace/X delete it, Esc deselects.
+    /// Z pen, X eraser, C highlighter, V lasso, 1–5 palette colors (left → right).
+    /// With a lasso selection: Delete/Backspace/X delete it, Esc deselects.
     private func handleToolShortcut(_ event: NSEvent) -> NSEvent? {
         guard event.type == .keyDown else { return event }
         let tool: Tool?
+        var colorSlot: Int?
         switch event.keyCode {
         case 6: tool = .pen            // Z
         case 7: tool = .eraser         // X
         case 8: tool = .highlighter    // C
         case 9: tool = .lasso          // V
+        case 18: tool = nil; colorSlot = 0   // 1
+        case 19: tool = nil; colorSlot = 1   // 2
+        case 20: tool = nil; colorSlot = 2   // 3
+        case 21: tool = nil; colorSlot = 3   // 4
+        case 23: tool = nil; colorSlot = 4   // 5
         case 51, 117, 53: tool = nil   // Delete, Forward Delete, Esc
         default: return event
         }
@@ -609,6 +632,11 @@ final class DrawingCanvasView: NSView {
               event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
               activePage == nil, lassoDrag == nil, !spaceHeld
         else { return event }
+
+        if let colorSlot {
+            if !event.isARepeat { onColorShortcut?(colorSlot) }
+            return nil
+        }
 
         let hasSelection = !selectedStrokes.isEmpty
         switch event.keyCode {
@@ -813,6 +841,112 @@ final class DrawingCanvasView: NSView {
         selectionPageIndex = chosen.isEmpty ? -1 : pageIndex
     }
 
+    // MARK: - Selection color bar
+
+    private static let barSwatchDiameter: CGFloat = 22
+    private static let barSwatchSpacing: CGFloat = 8
+    private static let barPadding: CGFloat = 10
+
+    private static func sameColor(_ a: StrokeColor, _ b: StrokeColor) -> Bool {
+        abs(a.red - b.red) < 0.005 && abs(a.green - b.green) < 0.005 && abs(a.blue - b.blue) < 0.005
+    }
+
+    /// Palette slot matching the selection's color: only when every selected
+    /// stroke has the same color and that color is one of the palette colors.
+    private var selectionPaletteSlot: Int? {
+        let strokes = selectedStrokes
+        guard let first = strokes.first,
+              strokes.allSatisfy({ Self.sameColor($0.color, first.color) }) else { return nil }
+        return paletteColors().firstIndex { Self.sameColor($0, first.color) }
+    }
+
+    /// Frame of the color bar: centered horizontally above the selection box
+    /// (above the rotate handle). If there's no room above it goes below, and it
+    /// is always kept inside the canvas.
+    private func colorBarRect(for g: SelectionGeometry) -> CGRect? {
+        let count = paletteColors().count
+        guard count > 0 else { return nil }
+        let n = CGFloat(count)
+        let width = n * Self.barSwatchDiameter + (n - 1) * Self.barSwatchSpacing + 2 * Self.barPadding
+        let height = Self.barSwatchDiameter + 2 * Self.barPadding
+        let points = g.corners + [g.rotateHandle]
+        let xs = points.map(\.x), ys = points.map(\.y)
+        guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return nil }
+
+        var rect = CGRect(x: (minX + maxX) / 2 - width / 2, y: maxY + 14, width: width, height: height)
+        if rect.maxY > bounds.maxY - 4 { rect.origin.y = minY - 14 - height }   // no room above
+        rect.origin.x = min(max(rect.origin.x, bounds.minX + 4), max(bounds.maxX - width - 4, bounds.minX + 4))
+        rect.origin.y = min(max(rect.origin.y, bounds.minY + 4), max(bounds.maxY - height - 4, bounds.minY + 4))
+        return rect
+    }
+
+    private func currentColorBarRect() -> CGRect? {
+        guard selectionPageIndex >= 0,
+              let page = pdfView?.document?.page(at: selectionPageIndex),
+              let g = selectionGeometry(page: page) else { return nil }
+        return colorBarRect(for: g)
+    }
+
+    private func swatchRect(_ index: Int, in bar: CGRect) -> CGRect {
+        CGRect(x: bar.minX + Self.barPadding + CGFloat(index) * (Self.barSwatchDiameter + Self.barSwatchSpacing),
+               y: bar.minY + Self.barPadding,
+               width: Self.barSwatchDiameter, height: Self.barSwatchDiameter)
+    }
+
+    /// Returns true if the click landed on the bar (and was handled).
+    private func handleColorBarClick(at point: CGPoint) -> Bool {
+        guard let bar = currentColorBarRect(), bar.contains(point) else { return false }
+        for (index, color) in paletteColors().enumerated()
+        where swatchRect(index, in: bar).insetBy(dx: -4, dy: -4).contains(point) {
+            recolorSelection(to: color)
+            break
+        }
+        return true   // clicks on the bar's padding are swallowed too
+    }
+
+    /// Gives every selected stroke `color` as one undoable step.
+    private func recolorSelection(to color: StrokeColor) {
+        let old = selectedStrokes
+        guard !old.isEmpty else { return }
+        let new = old.map { stroke -> Stroke in
+            var recolored = stroke
+            recolored.color = color
+            return recolored
+        }
+        guard new != old else { return }
+        new.forEach { store.replace($0) }
+        registerReplace(old: old, new: new, actionName: "Change Color")
+        needsDisplay = true
+    }
+
+    private func drawColorBar(for g: SelectionGeometry) {
+        guard let bar = colorBarRect(for: g) else { return }
+        let box = NSBezierPath(roundedRect: bar, xRadius: 10, yRadius: 10)
+        NSColor(calibratedWhite: 0.10, alpha: 0.96).setFill()
+        box.fill()
+        NSColor.white.withAlphaComponent(0.15).setStroke()
+        box.lineWidth = 1
+        box.stroke()
+
+        let selected = selectionPaletteSlot
+        for (index, color) in paletteColors().enumerated() {
+            let rect = swatchRect(index, in: bar)
+            let circle = NSBezierPath(ovalIn: rect)
+            NSColor(srgbRed: color.red, green: color.green, blue: color.blue, alpha: 1).setFill()
+            circle.fill()
+            // Thin outline keeps dark colors visible on the dark box.
+            NSColor.white.withAlphaComponent(0.45).setStroke()
+            circle.lineWidth = 1
+            circle.stroke()
+            if index == selected {
+                let ring = NSBezierPath(ovalIn: rect.insetBy(dx: -3.5, dy: -3.5))
+                NSColor.white.setStroke()
+                ring.lineWidth = 2
+                ring.stroke()
+            }
+        }
+    }
+
     // Undo for transforms: swap between two sets of stroke versions.
     private func registerReplace(old: [Stroke], new: [Stroke], actionName: String) {
         undoManager?.registerUndo(withTarget: self) { target in
@@ -872,6 +1006,7 @@ final class DrawingCanvasView: NSView {
         }
         g.corners.forEach { handle(at: $0, round: false) }
         handle(at: g.rotateHandle, round: true)
+        drawColorBar(for: g)
     }
 
     // MARK: - Cursor
