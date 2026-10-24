@@ -1,8 +1,9 @@
 import AppKit
 import PDFKit
 
-/// Sidebar page thumbnails with per-page context menus, Delete-key handling and
-/// drag-to-reorder, layered on `PDFThumbnailView`.
+/// Sidebar page thumbnails with per-page context menus, Delete-key handling,
+/// multi-selection (⌘-click / ⇧-click) and drag-to-reorder, layered on
+/// `PDFThumbnailView`.
 ///
 /// `PDFThumbnailView` hosts a private `NSCollectionView` (`PDFIconCollectionView`)
 /// internally. That collection view is still an `NSCollectionView`, so its public
@@ -12,15 +13,21 @@ final class PageSidebarView: PDFThumbnailView {
 
     /// Returns the context menu to show for the page at `index`.
     var pageMenuProvider: ((Int) -> NSMenu?)?
-    /// Invoked when Delete/Backspace is pressed while a page is selected.
+    /// Invoked when Delete/Backspace is pressed while pages are selected.
     var onDeleteKey: (() -> Void)?
-    /// Invoked when a thumbnail is dragged to a new spot. `from` is the page's
-    /// current index and `to` the index it should end up at.
-    var onMovePage: ((_ from: Int, _ to: Int) -> Void)?
+    /// Invoked when one or more thumbnails are dragged to a new spot.
+    /// `indexes` are the (sorted) indices of the dragged pages and `insertion`
+    /// is the gap (0...pageCount, in the pre-move list) they were dropped on.
+    var onMovePages: ((_ indexes: [Int], _ insertion: Int) -> Void)?
 
     // MARK: Drag-to-reorder state
     private var dragMonitor: Any?
     private var dragSourceIndex: Int?
+    /// Selection as it was when the mouse went down, i.e. before the click
+    /// itself changed it. Dragging a page that is part of a multi-selection
+    /// moves the whole selection.
+    private var selectionAtMouseDown: [Int] = []
+    private var draggedIndexes: [Int] = []
     private var dragStartPoint: CGPoint = .zero
     private var isReordering = false
     private var dropInsertionIndex: Int?
@@ -39,6 +46,14 @@ final class PageSidebarView: PDFThumbnailView {
         guard let document = pdfView?.document, let page = selectedPages?.first else { return nil }
         let index = document.index(for: page)
         return (index >= 0 && index < document.pageCount) ? index : nil
+    }
+
+    /// Indices of all selected pages, ascending.
+    var selectedPageIndexes: [Int] {
+        guard let document = pdfView?.document, let pages = selectedPages else { return [] }
+        let indexes = pages.map { document.index(for: $0) }
+            .filter { $0 != NSNotFound && $0 >= 0 && $0 < document.pageCount }
+        return Array(Set(indexes)).sorted()
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -79,8 +94,11 @@ final class PageSidebarView: PDFThumbnailView {
             guard bounds.contains(point), !isHiddenOrHasHiddenAncestor,
                   (pdfView?.document?.pageCount ?? 0) > 1,
                   let index = pageIndex(at: point) else { return event }
+            // ⌘/⇧-click extends the selection; it never starts a reorder.
+            if !event.modifierFlags.intersection([.command, .shift]).isEmpty { return event }
             dragSourceIndex = index
             dragStartPoint = point
+            selectionAtMouseDown = selectedPageIndexes
             return event
 
         case .leftMouseDragged:
@@ -88,6 +106,9 @@ final class PageSidebarView: PDFThumbnailView {
             if !isReordering {
                 guard hypot(point.x - dragStartPoint.x, point.y - dragStartPoint.y) > 6 else { return event }
                 isReordering = true
+                // Dragging a selected page drags the whole selection.
+                draggedIndexes = (selectionAtMouseDown.count > 1 && selectionAtMouseDown.contains(source))
+                    ? selectionAtMouseDown : [source]
                 NSCursor.closedHand.push()
             }
             if let collection = Self.findCollectionView(in: self) {
@@ -95,25 +116,25 @@ final class PageSidebarView: PDFThumbnailView {
             }
             let insertion = insertionIndex(at: point)
             dropInsertionIndex = insertion
-            updateDropIndicator(forInsertionAt: insertion, source: source)
+            updateDropIndicator(forInsertionAt: insertion)
             return nil
 
         case .leftMouseUp:
             defer {
                 dragSourceIndex = nil
                 dropInsertionIndex = nil
+                draggedIndexes = []
                 dropIndicator.isHidden = true
             }
-            guard isReordering, let source = dragSourceIndex else {
+            guard isReordering, dragSourceIndex != nil else {
                 isReordering = false
                 return event
             }
             isReordering = false
             NSCursor.pop()
-            if let insertion = dropInsertionIndex {
-                // `insertion` is a gap in the pre-move list; convert to the final index.
-                let final = insertion > source ? insertion - 1 : insertion
-                if final != source { onMovePage?(source, final) }
+            if let insertion = dropInsertionIndex,
+               !Self.isNoOpMove(of: draggedIndexes, toInsertionAt: insertion) {
+                onMovePages?(draggedIndexes, insertion)
             }
             return nil
 
@@ -136,12 +157,20 @@ final class PageSidebarView: PDFThumbnailView {
         return count
     }
 
-    private func updateDropIndicator(forInsertionAt insertion: Int, source: Int) {
+    /// True when dropping `indexes` (ascending) on `insertion` would leave the
+    /// page order unchanged.
+    private static func isNoOpMove(of indexes: [Int], toInsertionAt insertion: Int) -> Bool {
+        guard let first = indexes.first else { return true }
+        let base = insertion - indexes.filter { $0 < insertion }.count
+        return indexes == Array(base..<(base + indexes.count)) && base >= 0 && first >= 0
+    }
+
+    private func updateDropIndicator(forInsertionAt insertion: Int) {
         guard let collection = Self.findCollectionView(in: self) else { return }
         let count = collection.numberOfItems(inSection: 0)
         guard count > 0 else { return }
         // Dropping right where it already is would be a no-op; hide the line.
-        if insertion == source || insertion == source + 1 {
+        if Self.isNoOpMove(of: draggedIndexes, toInsertionAt: insertion) {
             dropIndicator.isHidden = true
             return
         }
@@ -171,13 +200,18 @@ final class PageSidebarView: PDFThumbnailView {
             super.rightMouseDown(with: event)
             return
         }
-        selectPage(at: index)
+        // Right-clicking inside a multi-selection keeps it (so the menu acts on
+        // all of it); right-clicking anywhere else selects just that page.
+        let selected = selectedPageIndexes
+        if !(selected.count > 1 && selected.contains(index)) {
+            selectPage(at: index)
+        }
         NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
     override func keyDown(with event: NSEvent) {
         // 51 = Delete (Backspace), 117 = Forward Delete.
-        if (event.keyCode == 51 || event.keyCode == 117), selectedPageIndex != nil {
+        if (event.keyCode == 51 || event.keyCode == 117), !selectedPageIndexes.isEmpty {
             onDeleteKey?()
         } else {
             super.keyDown(with: event)

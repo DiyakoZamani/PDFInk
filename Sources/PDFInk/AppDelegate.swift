@@ -82,10 +82,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
+    /// An untitled blank document only exists in a temporary file, so ask to
+    /// save it (Save panel sheet) before quitting.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard demoDirector == nil,
+              let controller = mainWindowController,
+              controller.hasUnsavedUntitledDocument else { return .terminateNow }
+        controller.askToSaveUntitled { shouldQuit in
+            NSApp.reply(toApplicationShouldTerminate: shouldQuit)
+        }
+        return .terminateLater
+    }
+
     // Finder / Dock / `open -a PDFInk file.pdf`
     func application(_ application: NSApplication, open urls: [URL]) {
-        guard let url = urls.first else { return }
-        mainWindowController?.openPDF(at: url)
+        guard let url = urls.first, let controller = mainWindowController else { return }
+        controller.confirmReplacingUntitledDocument { controller.openPDF(at: url) }
     }
 
     // MARK: - Menu bar
@@ -134,7 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                            action: #selector(MainWindowController.addPageAction(_:)),
                                            keyEquivalent: "n")
         addPageItem.keyEquivalentModifierMask = [.command, .shift]
-        fileMenu.addItem(withTitle: "Delete Page",
+        fileMenu.addItem(withTitle: "Delete Selected Pages",
                          action: #selector(MainWindowController.deletePageAction(_:)),
                          keyEquivalent: "")
         fileMenu.addItem(.separator())

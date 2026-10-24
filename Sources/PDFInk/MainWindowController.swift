@@ -36,6 +36,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     private let palette = ColorPalette()
 
     private(set) var fileURL: URL?
+    /// True for a freshly created blank document that has no name/location yet.
+    /// It lives in a temporary file (so autosave and page edits keep working)
+    /// until the user picks a place for it with the Save panel.
+    private(set) var isUntitled = false
+    var hasUnsavedUntitledDocument: Bool { isUntitled && pdfView.document != nil }
     /// Template used when this document was created as a whiteboard; Add Page
     /// appends a matching page (blank for opened PDFs).
     private(set) var whiteboardTemplate: WhiteboardTemplate?
@@ -86,12 +91,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         thumbnailView.pageMenuProvider = { [weak self] index in
             self?.pageContextMenu(for: index)
         }
-        thumbnailView.onMovePage = { [weak self] from, to in
-            self?.movePage(from: from, to: to)
+        thumbnailView.allowsMultipleSelection = true
+        thumbnailView.onMovePages = { [weak self] indexes, insertion in
+            self?.movePages(indexes, toInsertionIndex: insertion)
         }
         thumbnailView.onDeleteKey = { [weak self] in
-            guard let self, let index = self.thumbnailView.selectedPageIndex else { return }
-            self.deletePage(at: index)
+            guard let self else { return }
+            let indexes = self.thumbnailView.selectedPageIndexes
+            if !indexes.isEmpty { self.deletePages(at: indexes) }
         }
 
         let splitView = NSSplitView()
@@ -103,7 +110,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
 
         dropContainer.onPDFDropped = { [weak self] url in
-            self?.openPDF(at: url)
+            self?.confirmReplacingUntitledDocument { self?.openPDF(at: url) }
         }
         dropContainer.translatesAutoresizingMaskIntoConstraints = false
         splitView.translatesAutoresizingMaskIntoConstraints = false
@@ -403,13 +410,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     }
     // MARK: - Document handling
 
-    func openPDF(at url: URL) {
+    func openPDF(at url: URL, untitled: Bool = false) {
         guard let document = PDFDocument(url: url) else {
             presentError(message: "Couldn't open PDF", info: url.path)
             return
         }
         autosave.saveNow() // preserve unsaved ink of the previous document
         fileURL = url
+        isUntitled = untitled
         whiteboardTemplate = nil // newWhiteboard(template:) restores it after
 
         // Reload editable strokes: an autosaved draft wins (it's newest);
@@ -463,14 +471,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         savedGeneration = store.generation
         window?.isDocumentEdited = false
         autosave.begin(documentURL: url)
-        window?.title = "PDFInk — \(url.lastPathComponent)"
-        window?.representedURL = url
-        NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        if untitled {
+            window?.title = "PDFInk — Untitled"
+            window?.representedURL = nil
+        } else {
+            window?.title = "PDFInk — \(url.lastPathComponent)"
+            window?.representedURL = url
+            NSDocumentController.shared.noteNewRecentDocumentURL(url)
+        }
         NSLog("PDFInk: opened \(url.lastPathComponent) with \(document.pageCount) pages")
     }
 
     func windowWillClose(_ notification: Notification) {
         persistDraftIfNeeded()
+    }
+
+    /// A named document is always on disk, but an untitled one only exists in a
+    /// temporary file: ask whether to save it (and where) before closing.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        guard hasUnsavedUntitledDocument else { return true }
+        askToSaveUntitled { [weak self] shouldClose in
+            if shouldClose { self?.window?.close() }
+        }
+        return false
     }
 
     // MARK: - Whiteboards (notebook-style)
@@ -487,6 +510,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     /// Creates a new whiteboard as a real PDF file (so save/autosave work
     /// immediately, notebook-style) and opens it.
     func newWhiteboard(template: WhiteboardTemplate) {
+        if isUntitled {
+            confirmReplacingUntitledDocument { [weak self] in self?.newWhiteboard(template: template) }
+            return
+        }
         do {
             let dir = try Self.whiteboardsDirectory()
             let formatter = DateFormatter()
@@ -509,11 +536,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
 
     // MARK: - Blank documents
 
-    static func documentsDirectory() throws -> URL {
-        let docs = try FileManager.default.url(for: .documentDirectory,
-                                               in: .userDomainMask,
-                                               appropriateFor: nil, create: true)
-        let dir = docs.appendingPathComponent("PDFInk Documents", isDirectory: true)
+    /// Where new blank documents live until the user saves them somewhere.
+    static func untitledDirectory() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PDFInk Untitled", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }
@@ -536,30 +562,122 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
                          info: "Pages must be 1–1000 and width/height must be positive numbers (in points).")
             return
         }
-        createBlankDocument(pageCount: options.count, size: options.size)
+        confirmReplacingUntitledDocument { [weak self] in
+            self?.createBlankDocument(pageCount: options.count, size: options.size)
+        }
     }
 
-    /// Writes a blank PDF (saved in ~/Documents/PDFInk Documents so save and
-    /// autosave work right away) and opens it.
+    /// Creates a blank PDF in a temporary file and opens it as an untitled
+    /// document. Nothing is written to the user's folders until they choose a
+    /// name and location with the Save panel (⌘S).
     func createBlankDocument(pageCount: Int, size: CGSize) {
         do {
-            let dir = try Self.documentsDirectory()
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd HH.mm"
-            let stamp = formatter.string(from: Date())
-            var url = dir.appendingPathComponent("Untitled \(stamp).pdf")
-            var counter = 2
-            while FileManager.default.fileExists(atPath: url.path) {
-                url = dir.appendingPathComponent("Untitled \(stamp) (\(counter)).pdf")
-                counter += 1
-            }
+            let url = try Self.untitledDirectory()
+                .appendingPathComponent("Untitled-\(UUID().uuidString).pdf")
             try WhiteboardTemplate.blank.pdfData(pageCount: pageCount, size: size).write(to: url)
-            openPDF(at: url)
-            NSLog("PDFInk: created blank document with %d pages (%.0fx%.0f pt) at %@",
-                  pageCount, size.width, size.height, url.path)
+            openPDF(at: url, untitled: true)
+            NSLog("PDFInk: created untitled blank document with %d pages (%.0fx%.0f pt)",
+                  pageCount, size.width, size.height)
         } catch {
             presentError(message: "Couldn't create document", info: error.localizedDescription)
         }
+    }
+
+    // MARK: - Saving untitled documents
+
+    /// Runs `proceed` right away, unless an untitled document is open: then it
+    /// asks to save it first and runs `proceed` only if the user didn't cancel.
+    func confirmReplacingUntitledDocument(then proceed: @escaping () -> Void) {
+        guard hasUnsavedUntitledDocument else { proceed(); return }
+        askToSaveUntitled { shouldProceed in
+            if shouldProceed { proceed() }
+        }
+    }
+
+    /// "Save / Don't Save / Cancel" sheet for the untitled document. Calls
+    /// `completion(true)` once it is saved or deliberately discarded and
+    /// `completion(false)` if the user cancels (or the save fails/is cancelled).
+    func askToSaveUntitled(completion: @escaping (Bool) -> Void) {
+        guard let window, hasUnsavedUntitledDocument else { completion(true); return }
+        let alert = NSAlert()
+        alert.messageText = "Do you want to save this document?"
+        alert.informativeText = "If you don't save, this document and its changes will be lost."
+        alert.addButton(withTitle: "Save…")
+        alert.addButton(withTitle: "Don't Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let self else { completion(false); return }
+            switch response {
+            case .alertFirstButtonReturn:
+                // Let the alert sheet finish closing before showing the Save panel.
+                DispatchQueue.main.async {
+                    self.presentSaveLocationPanel(completion: completion)
+                }
+            case .alertSecondButtonReturn:
+                self.discardUntitled()
+                completion(true)
+            default:
+                completion(false)
+            }
+        }
+    }
+
+    /// The standard Save sheet: pick a folder in Finder-style browsing and type
+    /// the file name at the top.
+    private func presentSaveLocationPanel(completion: ((Bool) -> Void)?) {
+        guard let window, pdfView.document != nil else { completion?(false); return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "Untitled.pdf"
+        panel.directoryURL = try? FileManager.default.url(for: .documentDirectory,
+                                                          in: .userDomainMask,
+                                                          appropriateFor: nil, create: false)
+        panel.beginSheetModal(for: window) { [weak self] response in
+            guard let self, response == .OK, let destination = panel.url else {
+                completion?(false)
+                return
+            }
+            completion?(self.saveUntitled(to: destination))
+        }
+    }
+
+    /// Writes the untitled document (with its ink) to `destination` and turns
+    /// it into a regular named document.
+    private func saveUntitled(to destination: URL) -> Bool {
+        guard let document = pdfView.document, let temporaryURL = fileURL,
+              let data = document.dataRepresentation(),
+              let copy = PDFDocument(data: data) else {
+            presentError(message: "Couldn't prepare document for saving", info: destination.lastPathComponent)
+            return false
+        }
+        AnnotationSerializer.apply(store: store, to: copy)
+        guard copy.write(to: destination) else {
+            presentError(message: "Couldn't save PDF", info: destination.path)
+            return false
+        }
+        autosave.clearDraft() // draft is keyed by the temporary path
+        try? FileManager.default.removeItem(at: temporaryURL)
+        fileURL = destination
+        isUntitled = false
+        savedGeneration = store.generation
+        window?.isDocumentEdited = false
+        autosave.begin(documentURL: destination)
+        window?.title = "PDFInk — \(destination.lastPathComponent)"
+        window?.representedURL = destination
+        NSDocumentController.shared.noteNewRecentDocumentURL(destination)
+        NSLog("PDFInk: saved untitled document to %@", destination.path)
+        return true
+    }
+
+    /// "Don't Save": throws the temporary file and its draft away.
+    private func discardUntitled() {
+        autosave.clearDraft()
+        autosave.detach()
+        if let url = fileURL { try? FileManager.default.removeItem(at: url) }
+        savedGeneration = store.generation
+        isUntitled = false
+        window?.isDocumentEdited = false
     }
 
     // MARK: - Adding pages
@@ -598,9 +716,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
             if currentIndex != NSNotFound { insertionIndex = currentIndex + 1 }
         }
 
-        var firstPage: PDFPage?
-        var lastPage: PDFPage?
-        var shiftedExistingPages = false
+        var insertedCount = 0
         for i in 0..<count {
             guard let page = template.makePage(size: size) else { break }
             let index = insertionIndex + i
@@ -609,27 +725,44 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
             // is keyed by page index, so it has to move with them.
             if index < document.pageCount - 1 {
                 store.insertPage(at: index, strokes: [])
-                shiftedExistingPages = true
             }
-            if firstPage == nil { firstPage = page }
-            lastPage = page
+            insertedCount += 1
         }
+        guard insertedCount > 0 else { return }
+
+        // Pages built in a scratch PDFDocument keep that document's numbering, so
+        // every new page would read "1" in the sidebar until the file is reopened.
+        // Round-tripping the document through its data makes PDFKit renumber all
+        // pages (exactly what reopening does).
+        reloadDocumentFromMemory()
         pdfView.layoutDocumentView()
-        if shiftedExistingPages { canvas?.storeStructureDidChange() }
+        canvas?.storeStructureDidChange()
         window?.isDocumentEdited = true
 
         // Scroll to the new pages: the first one when inserting after the
         // current page, otherwise the last one at the end of the document.
-        if let target = afterCurrent ? firstPage : lastPage {
+        let targetIndex = afterCurrent ? insertionIndex : insertionIndex + insertedCount - 1
+        if let document = pdfView.document, let target = document.page(at: targetIndex) {
             let top = CGPoint(x: 0, y: target.bounds(for: pdfView.displayBox).maxY)
             pdfView.go(to: PDFDestination(page: target, at: top))
         }
         NSLog("PDFInk: added %d %@ pages (%.0fx%.0f pt) at index %d, document now has %d pages",
-              count, template.rawValue, size.width, size.height, insertionIndex, document.pageCount)
+              insertedCount, template.rawValue, size.width, size.height, insertionIndex,
+              pdfView.document?.pageCount ?? 0)
         // Persist the new page structure immediately: the draft/autosave mechanism
         // only serializes strokes (keyed by page index), not pages, so unsaved
         // pages would vanish on restart and leave their ink orphaned.
         saveDocumentAction(nil)
+    }
+
+    /// Replaces the displayed document with a fresh copy built from its own data
+    /// (same pages and content, annotation-free display copy as before). Used to
+    /// make PDFKit recompute page labels/thumbnails after pages were inserted.
+    private func reloadDocumentFromMemory() {
+        guard let document = pdfView.document,
+              let data = document.dataRepresentation(),
+              let fresh = PDFDocument(data: data) else { return }
+        pdfView.document = fresh
     }
 
     /// Prompts for how many pages to add, their size in PDF points, and whether
@@ -695,96 +828,165 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
 
     // MARK: - Page reordering
 
-    /// Moves the page at `from` so it ends up at index `to` (drag-and-drop in
-    /// the sidebar). Ink follows its page, and the move is undoable.
+    /// Moves a single page so it ends up at index `to`. Ink follows its page,
+    /// and the move is undoable.
     func movePage(from: Int, to: Int) {
         guard let document = pdfView.document, from != to,
               (0..<document.pageCount).contains(from),
-              (0..<document.pageCount).contains(to),
-              let page = document.page(at: from) else { return }
+              (0..<document.pageCount).contains(to) else { return }
+        let insertion = to > from ? to + 1 : to
+        movePages([from], toInsertionIndex: insertion)
+    }
 
-        document.removePage(at: from)
-        document.insert(page, at: to)
-        store.movePage(from: from, to: to)
+    /// Moves several pages at once (drag-and-drop of a multi-selection in the
+    /// sidebar). `insertion` is the gap (0...pageCount) in the current page list
+    /// the pages are dropped on; the moved pages keep their relative order.
+    func movePages(_ indexes: [Int], toInsertionIndex insertion: Int) {
+        guard let document = pdfView.document else { return }
+        let count = document.pageCount
+        let moving = Array(Set(indexes.filter { (0..<count).contains($0) })).sorted()
+        guard !moving.isEmpty, (0...count).contains(insertion) else { return }
+
+        let movingSet = Set(moving)
+        let rest = (0..<count).filter { !movingSet.contains($0) }
+        let restBefore = insertion - moving.filter { $0 < insertion }.count
+        let newOrder = Array(rest.prefix(restBefore)) + moving + Array(rest.dropFirst(restBefore))
+        guard newOrder != Array(0..<count) else { return }
+
+        applyPageOrder(newOrder, actionName: moving.count > 1 ? "Move Pages" : "Move Page")
+        if let first = pdfView.document?.page(at: restBefore) { pdfView.go(to: first) }
+        NSLog("PDFInk: moved %d page(s) to position %d", moving.count, restBefore)
+    }
+
+    /// Reorders the document so that new position `i` holds the page that is
+    /// currently at `newOrder[i]`. Ink follows its pages and the whole change is
+    /// one undo step (undo applies the inverse permutation).
+    private func applyPageOrder(_ newOrder: [Int], actionName: String) {
+        guard let document = pdfView.document, newOrder.count == document.pageCount else { return }
+        let pages = (0..<document.pageCount).compactMap { document.page(at: $0) }
+        guard pages.count == newOrder.count else { return }
+        let desired = newOrder.map { pages[$0] }
+
+        // Selection-sort with single moves; positions before `target` are final.
+        for target in 0..<desired.count {
+            let from = document.index(for: desired[target])
+            if from == NSNotFound || from == target { continue }
+            document.removePage(at: from)
+            document.insert(desired[target], at: target)
+            store.movePage(from: from, to: target)
+        }
         pdfView.layoutDocumentView()
         canvas?.storeStructureDidChange()
-        pdfView.go(to: page)
 
+        var inverse = [Int](repeating: 0, count: newOrder.count)
+        for (newPosition, oldIndex) in newOrder.enumerated() { inverse[oldIndex] = newPosition }
         window?.undoManager?.registerUndo(withTarget: self) { target in
-            target.movePage(from: to, to: from)
+            target.applyPageOrder(inverse, actionName: actionName)
         }
-        window?.undoManager?.setActionName("Move Page")
+        window?.undoManager?.setActionName(actionName)
         saveDocumentAction(nil)
-        NSLog("PDFInk: moved page %d to %d", from, to)
     }
 
     // MARK: - Page deletion
 
-    /// Context menu shown when right-clicking a page thumbnail. Additional
-    /// per-page actions can be appended here later.
+    /// Context menu shown when right-clicking a page thumbnail. Acts on the
+    /// whole selection when the clicked page is part of a multi-selection.
     private func pageContextMenu(for index: Int) -> NSMenu {
+        let selected = thumbnailView.selectedPageIndexes
+        let targets = (selected.count > 1 && selected.contains(index)) ? selected : [index]
         let menu = NSMenu()
-        let deleteItem = NSMenuItem(title: "Delete Page",
+        let deleteItem = NSMenuItem(title: targets.count > 1 ? "Delete \(targets.count) Pages" : "Delete Page",
                                     action: #selector(deletePageAction(_:)),
                                     keyEquivalent: "")
         deleteItem.target = self
-        deleteItem.representedObject = index
+        deleteItem.representedObject = targets
         menu.addItem(deleteItem)
         return menu
     }
 
-    /// Menu/keyboard entry point: deletes the page the user picked (context
-    /// menu) or the selected/current page.
+    /// Menu/keyboard entry point: deletes the pages the user picked (context
+    /// menu) or the selected pages / current page.
     @objc func deletePageAction(_ sender: Any?) {
-        let index = (sender as? NSMenuItem)?.representedObject as? Int
-            ?? thumbnailView.selectedPageIndex
-            ?? pdfView.currentPage.flatMap { pdfView.document?.index(for: $0) }
-        guard let index else { return }
-        deletePage(at: index)
+        if let indexes = (sender as? NSMenuItem)?.representedObject as? [Int] {
+            deletePages(at: indexes)
+            return
+        }
+        let selected = thumbnailView.selectedPageIndexes
+        if !selected.isEmpty {
+            deletePages(at: selected)
+            return
+        }
+        if let current = pdfView.currentPage, let document = pdfView.document {
+            let index = document.index(for: current)
+            if index != NSNotFound { deletePage(at: index) }
+        }
     }
 
-    /// Deletes the page at `index`, remaps stroke page indices, and persists the
-    /// change. Registers an undo that restores the page and its ink.
     func deletePage(at index: Int) {
-        guard let document = pdfView.document, index >= 0, index < document.pageCount else { return }
-        guard document.pageCount > 1 else {
-            presentError(message: "Can't delete the only page",
+        deletePages(at: [index])
+    }
+
+    private struct RemovedPage {
+        let index: Int
+        let page: PDFPage
+        let strokes: [Stroke]
+    }
+
+    /// Deletes the given pages, remaps stroke page indices, and persists the
+    /// change. Registers one undo that restores all pages and their ink.
+    func deletePages(at indexes: [Int]) {
+        guard let document = pdfView.document else { return }
+        let targets = Array(Set(indexes.filter { $0 >= 0 && $0 < document.pageCount })).sorted()
+        guard let firstTarget = targets.first else { return }
+        guard targets.count < document.pageCount else {
+            presentError(message: targets.count == 1 ? "Can't delete the only page" : "Can't delete every page",
                          info: "A PDF must keep at least one page.")
             return
         }
-        guard let page = document.page(at: index) else { return }
-        let removedStrokes = store.strokes(onPage: index)
+        let removed: [RemovedPage] = targets.compactMap { index in
+            guard let page = document.page(at: index) else { return nil }
+            return RemovedPage(index: index, page: page, strokes: store.strokes(onPage: index))
+        }
 
-        document.removePage(at: index)
-        store.removePage(at: index)
+        // Highest index first, so the lower indices stay valid while deleting.
+        for item in removed.reversed() {
+            document.removePage(at: item.index)
+            store.removePage(at: item.index)
+        }
         pdfView.layoutDocumentView()
         canvas?.storeStructureDidChange()
         // Keep a valid page current so the sidebar selection stays meaningful.
-        let neighbour = document.page(at: min(index, document.pageCount - 1))
-        if let neighbour { pdfView.go(to: neighbour) }
-
-        window?.undoManager?.registerUndo(withTarget: self) { target in
-            target.restorePage(page, at: index, strokes: removedStrokes)
+        if let neighbour = document.page(at: min(firstTarget, document.pageCount - 1)) {
+            pdfView.go(to: neighbour)
         }
-        window?.undoManager?.setActionName("Delete Page")
+
+        let name = removed.count > 1 ? "Delete Pages" : "Delete Page"
+        window?.undoManager?.registerUndo(withTarget: self) { target in
+            target.restorePages(removed)
+        }
+        window?.undoManager?.setActionName(name)
         saveDocumentAction(nil)
-        NSLog("PDFInk: deleted page %d, document now has %d pages", index, document.pageCount)
+        NSLog("PDFInk: deleted %d page(s), document now has %d pages", removed.count, document.pageCount)
     }
 
-    /// Inverse of `deletePage(at:)` (used by undo): re-inserts the page and its
-    /// strokes at `index` and persists.
-    func restorePage(_ page: PDFPage, at index: Int, strokes: [Stroke]) {
+    /// Inverse of `deletePages(at:)` (used by undo): re-inserts the pages and
+    /// their strokes at their original indices and persists.
+    private func restorePages(_ items: [RemovedPage]) {
         guard let document = pdfView.document else { return }
-        let clamped = min(max(index, 0), document.pageCount)
-        document.insert(page, at: clamped)
-        store.insertPage(at: clamped, strokes: strokes)
+        // Ascending order puts every page back at its original index.
+        for item in items.sorted(by: { $0.index < $1.index }) {
+            let clamped = min(max(item.index, 0), document.pageCount)
+            document.insert(item.page, at: clamped)
+            store.insertPage(at: clamped, strokes: item.strokes)
+        }
         pdfView.layoutDocumentView()
         canvas?.storeStructureDidChange()
 
+        let indexes = items.map(\.index)
         window?.undoManager?.registerUndo(withTarget: self) { target in
-            target.deletePage(at: clamped)
+            target.deletePages(at: indexes)
         }
-        window?.undoManager?.setActionName("Delete Page")
+        window?.undoManager?.setActionName(items.count > 1 ? "Delete Pages" : "Delete Page")
         saveDocumentAction(nil)
     }
 
@@ -894,14 +1096,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         panel.allowsMultipleSelection = false
         panel.beginSheetModal(for: window!) { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
-            self?.openPDF(at: url)
+            self?.confirmReplacingUntitledDocument { self?.openPDF(at: url) }
         }
     }
 
     /// Cmd+S: writes strokes as ink annotations into the PDF in place.
     /// The annotations are applied to a copy so the display document (and the
     /// canvas as source of truth) stay annotation-free.
+    ///
+    /// For an untitled blank document, Cmd+S (a user action, `sender != nil`)
+    /// opens the standard Save panel to pick a folder and name. Internal calls
+    /// with a nil sender just persist to the temporary file.
     @objc func saveDocumentAction(_ sender: Any?) {
+        if isUntitled, sender != nil {
+            presentSaveLocationPanel(completion: nil)
+            return
+        }
         guard let document = pdfView.document, let url = fileURL else { return }
         guard let data = document.dataRepresentation(),
               let copy = PDFDocument(data: data) else {

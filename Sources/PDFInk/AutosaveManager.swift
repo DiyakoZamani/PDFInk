@@ -52,6 +52,13 @@ final class AutosaveManager {
         timer = nil
     }
 
+    /// Stops autosaving and forgets the document, so a later `saveNow()` can't
+    /// resurrect a draft for a document that was just discarded.
+    func detach() {
+        stop()
+        documentURL = nil
+    }
+
     func autosaveIfNeeded() {
         guard store.generation != lastSavedGeneration else { return }
         saveNow()

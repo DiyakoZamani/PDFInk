@@ -51,13 +51,16 @@ reinstall).
   (works on opened PDFs too, adding blank pages).
 - **Blank documents**: File ▸ Create a Blank Document… (⌘⌥N, also a button on
   the start screen) asks for the page count and paper size (A4/A3/A5/Letter/
-  Legal or custom) and saves a new PDF in `~/Documents/PDFInk Documents/`.
+  Legal or custom) and opens it as an untitled document. Press ⌘S to pick
+  the folder and file name in the standard Save panel (you're also asked when
+  closing, quitting or opening something else while it is unsaved).
 - Page management: Add Pages prompts for count and dimensions, with an
   "Add after current page" checkbox (otherwise pages go after the last page).
-  In the page sidebar, drag a thumbnail to rearrange pages (ink follows its
-  page; undoable). Right-click a thumbnail for **Delete Page** (or select a
-  page and press Delete). Deletions remap ink to follow the pages and are
-  undoable via ⌘Z.
+  In the page sidebar, ⌘-click or ⇧-click to select several pages, then drag
+  any selected thumbnail to rearrange them together (ink follows its pages;
+  undoable). Right-click a thumbnail for **Delete Page** / **Delete N Pages**
+  (or select pages and press Delete). Deletions remap ink to follow the pages
+  and are undoable via ⌘Z.
 - Text Select tool: the **T** button in the toolbar (or press T) lets you
   select and copy PDF text.
 
