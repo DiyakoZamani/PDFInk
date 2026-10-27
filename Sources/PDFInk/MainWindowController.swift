@@ -8,6 +8,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     let pdfView = PDFView()
     let thumbnailView = PageSidebarView()
     private let dropContainer = DropContainerView()
+    private var undoRedoControl: UndoRedoControlView?
+    private var undoRedoObservers: [NSObjectProtocol] = []
     private let placeholderLabel = NSTextField(labelWithString: "Drop a PDF here or use File ▸ Open (⌘O)")
     private lazy var createBlankButton: NSButton = {
         let button = NSButton(title: "Create a blank document",
@@ -58,12 +60,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         window.delegate = self
         setUpContentView()
         setUpToolbar()
+        observeUndoManager()
         toolState.color = palette.colors[palette.activeSlot]
 
         store.onChange = { [weak self] pageIndex in
             guard let self else { return }
             self.canvas?.storeDidChange(pageIndex: pageIndex)
             self.window?.isDocumentEdited = true
+            self.updateUndoRedoControl()
         }
         toolState.onChange = { [weak self] in
             self?.canvas?.toolStateDidChange()
@@ -124,6 +128,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         createBlankButton.translatesAutoresizingMaskIntoConstraints = false
         dropContainer.addSubview(createBlankButton)
 
+        let undoRedo = UndoRedoControlView(
+            onUndo: { [weak self] in self?.undo(nil) },
+            onRedo: { [weak self] in self?.redo(nil) },
+            onDragEnded: { [weak self] in self?.snapUndoRedoControl() })
+        undoRedoControl = undoRedo
+        dropContainer.addSubview(undoRedo)
+        positionUndoRedoControl()
+
         // Drawing overlay sits on top of the PDFView, same frame, and maps all
         // input through PDFView's page geometry.
         let canvasView = DrawingCanvasView(pdfView: pdfView, store: store, toolState: toolState)
@@ -164,6 +176,82 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         toolbar.displayMode = .iconOnly
         toolbar.allowsUserCustomization = false
         window?.toolbar = toolbar
+    }
+
+    private enum UndoRedoDockPosition: String {
+        case top, bottomLeft, bottomRight
+    }
+
+    private var undoRedoDockPosition: UndoRedoDockPosition {
+        get {
+            UndoRedoDockPosition(rawValue: UserDefaults.standard.string(forKey: "PDFInk.undoRedoDockPosition") ?? "") ?? .top
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: "PDFInk.undoRedoDockPosition")
+        }
+    }
+
+    private func positionUndoRedoControl() {
+        guard let control = undoRedoControl else { return }
+        let bounds = dropContainer.bounds
+        let margin: CGFloat = 16
+        let size = NSSize(width: 94, height: 34)
+        let x: CGFloat
+        let y: CGFloat
+        switch undoRedoDockPosition {
+        case .top:
+            x = (bounds.width - size.width) / 2
+            y = bounds.height - size.height - margin
+        case .bottomLeft:
+            x = margin
+            y = margin
+        case .bottomRight:
+            x = bounds.width - size.width - margin
+            y = margin
+        }
+        control.setFrameSize(size)
+        control.setFrameOrigin(NSPoint(x: max(margin, x), y: max(margin, y)))
+    }
+
+    private func snapUndoRedoControl() {
+        guard let control = undoRedoControl else { return }
+        let bounds = dropContainer.bounds
+        let center = NSPoint(x: control.frame.midX, y: control.frame.midY)
+        let nearTop = center.y > bounds.height * 0.62
+        if nearTop {
+            undoRedoDockPosition = .top
+        } else {
+            undoRedoDockPosition = center.x < bounds.midX ? .bottomLeft : .bottomRight
+        }
+        positionUndoRedoControl()
+    }
+
+    private func updateUndoRedoControl() {
+        undoRedoControl?.updateEnabledState(
+            canUndo: window?.undoManager?.canUndo ?? false,
+            canRedo: window?.undoManager?.canRedo ?? false)
+    }
+
+    private func observeUndoManager() {
+        guard let manager = window?.undoManager else { return }
+        let center = NotificationCenter.default
+        for name in [Notification.Name.NSUndoManagerDidUndoChange,
+                     Notification.Name.NSUndoManagerDidRedoChange,
+                     Notification.Name.NSUndoManagerDidCloseUndoGroup] {
+            undoRedoObservers.append(center.addObserver(
+                forName: name, object: manager, queue: .main) { [weak self] _ in
+                    self?.updateUndoRedoControl()
+                })
+        }
+        updateUndoRedoControl()
+    }
+
+    func windowDidResize(_ notification: Notification) {
+        positionUndoRedoControl()
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        positionUndoRedoControl()
     }
 
     fileprivate func makeToolsItem() -> NSToolbarItem {
@@ -458,6 +546,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
         // otherwise recover strokes from PDFInk annotations saved in the file.
         store.removeAll()
         window?.undoManager?.removeAllActions()
+        updateUndoRedoControl()
         // Drop strokes that reference pages no longer present in the document
         // (ink orphaned by a session that added pages without persisting them);
         // otherwise they would silently reappear on a page added later.
@@ -517,6 +606,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     }
 
     func windowWillClose(_ notification: Notification) {
+        for observer in undoRedoObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        undoRedoObservers.removeAll()
         persistDraftIfNeeded()
     }
 
@@ -1040,6 +1133,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
     func discardDraftAndInk() {
         store.removeAll()
         window?.undoManager?.removeAllActions()
+        updateUndoRedoControl()
         autosave.clearDraft()
         savedGeneration = store.generation
         window?.isDocumentEdited = false
@@ -1271,6 +1365,132 @@ final class MainWindowController: NSWindowController, NSWindowDelegate, NSMenuIt
             return false
         }
         return super.responds(to: aSelector)
+    }
+}
+
+/// Compact, draggable undo/redo control. Drag the narrow grip on the left to
+/// dock it at the top or either bottom corner of the document area.
+final class UndoRedoControlView: NSView {
+    private let undoButton = NSButton()
+    private let redoButton = NSButton()
+    private let grip = NSTextField(labelWithString: "⠿")
+    private let onUndo: () -> Void
+    private let onRedo: () -> Void
+    private let onDragEnded: () -> Void
+    private var dragOffset = NSPoint.zero
+    private var isDragging = false
+
+    init(onUndo: @escaping () -> Void,
+         onRedo: @escaping () -> Void,
+         onDragEnded: @escaping () -> Void) {
+        self.onUndo = onUndo
+        self.onRedo = onRedo
+        self.onDragEnded = onDragEnded
+        super.init(frame: NSRect(x: 0, y: 0, width: 94, height: 34))
+
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
+        layer?.cornerRadius = 7
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.separatorColor.cgColor
+        layer?.shadowColor = NSColor.black.withAlphaComponent(0.18).cgColor
+        layer?.shadowOpacity = 1
+        layer?.shadowRadius = 4
+        layer?.shadowOffset = CGSize(width: 0, height: -1)
+
+        grip.translatesAutoresizingMaskIntoConstraints = false
+        grip.textColor = .secondaryLabelColor
+        grip.alignment = .center
+        grip.font = .systemFont(ofSize: 12, weight: .medium)
+        grip.toolTip = "Drag to move this control"
+        addSubview(grip)
+
+        configure(undoButton, symbol: "arrow.uturn.backward", title: "Undo", action: #selector(undoPressed))
+        configure(redoButton, symbol: "arrow.uturn.forward", title: "Redo", action: #selector(redoPressed))
+        addSubview(undoButton)
+        addSubview(redoButton)
+
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(separator)
+
+        NSLayoutConstraint.activate([
+            grip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            grip.centerYAnchor.constraint(equalTo: centerYAnchor),
+            grip.widthAnchor.constraint(equalToConstant: 13),
+            undoButton.leadingAnchor.constraint(equalTo: grip.trailingAnchor, constant: 1),
+            undoButton.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            undoButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
+            undoButton.widthAnchor.constraint(equalToConstant: 34),
+            separator.leadingAnchor.constraint(equalTo: undoButton.trailingAnchor),
+            separator.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            separator.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
+            separator.widthAnchor.constraint(equalToConstant: 1),
+            redoButton.leadingAnchor.constraint(equalTo: separator.trailingAnchor),
+            redoButton.topAnchor.constraint(equalTo: topAnchor, constant: 3),
+            redoButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
+            redoButton.widthAnchor.constraint(equalToConstant: 34),
+            redoButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
+        ])
+        updateEnabledState(canUndo: false, canRedo: false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    private func configure(_ button: NSButton, symbol: String, title: String, action: Selector) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.title = ""
+        button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleProportionallyDown
+        button.target = self
+        button.action = action
+        button.bezelStyle = .shadowlessSquare
+        button.isBordered = false
+        button.toolTip = title
+        button.setAccessibilityLabel(title)
+    }
+
+    func updateEnabledState(canUndo: Bool, canRedo: Bool) {
+        undoButton.isEnabled = canUndo
+        redoButton.isEnabled = canRedo
+    }
+
+    @objc private func undoPressed() { onUndo() }
+    @objc private func redoPressed() { onRedo() }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Keep the grip's hit area on this view so its mouse tracking can drag
+        // the whole control instead of being intercepted by the label subview.
+        if bounds.contains(point), point.x <= 17 { return self }
+        return super.hitTest(point)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard point.x <= 17 else {
+            super.mouseDown(with: event)
+            return
+        }
+        isDragging = true
+        guard let parent = superview else { return }
+        let parentPoint = parent.convert(event.locationInWindow, from: nil)
+        dragOffset = NSPoint(x: parentPoint.x - frame.minX,
+                             y: parentPoint.y - frame.minY)
+        while true {
+            guard let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) else { break }
+            if next.type == .leftMouseUp {
+                isDragging = false
+                onDragEnded()
+                break
+            }
+            guard isDragging else { continue }
+            let currentPoint = parent.convert(next.locationInWindow, from: nil)
+            frame.origin = NSPoint(x: currentPoint.x - dragOffset.x,
+                                   y: currentPoint.y - dragOffset.y)
+        }
     }
 }
 
