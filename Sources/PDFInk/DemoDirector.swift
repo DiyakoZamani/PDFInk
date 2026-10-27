@@ -477,6 +477,7 @@ final class DemoDirector {
                                   y: CGFloat(h) * 0.52))
 
         var subY = CGFloat(h) * 0.52 - 56 * scale
+
         for line in subtitle.components(separatedBy: "\n") {
             let subStr = NSAttributedString(string: line, attributes: subAttrs)
             let subSize = subStr.size()
