@@ -4,4 +4,5 @@ dist/
 .clt-fix/
 .swiftpm-libs-fix/
 .DS_Store
+*.zip
 *.patch
