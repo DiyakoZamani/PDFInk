@@ -125,14 +125,15 @@ final class DrawingCanvasView: NSView {
             return event
         }
         observePDFViewChanges()
+        // The ONE place that enforces the cursor. PDFView (our parent) also sets
+        // cursors from its own tracking areas, so we re-apply ours once, after
+        // the event has been fully dispatched. Requests are coalesced.
         cursorMonitor = NSEvent.addLocalMonitorForEvents(
-            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .mouseMoved]
+            matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp, .mouseMoved,
+                       .mouseEntered, .mouseExited, .cursorUpdate, .scrollWheel]
         ) { [weak self] event in
             guard let self, event.window === self.window else { return event }
-            let p = self.convert(event.locationInWindow, from: nil)
-            if self.bounds.contains(p) {
-                DispatchQueue.main.async { [weak self] in self?.activeCursor.set() }
-            }
+            self.scheduleCursorRefresh()
             return event
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
@@ -226,7 +227,7 @@ final class DrawingCanvasView: NSView {
         if toolState.tool != .lasso, !selectedIDs.isEmpty { clearSelection() }
         if toolState.tool == .image { onImageToolSelected?() }
         window?.invalidateCursorRects(for: self)
-        activeCursor.set()
+        scheduleCursorRefresh()
     }
 
     // MARK: - PDFView observation
@@ -394,10 +395,8 @@ final class DrawingCanvasView: NSView {
         if spaceHeld {                                   // NEW
             isPanning = true                             // NEW
             lastPanWindowPoint = convert(viewPoint(for: event), to: nil)   // NEW
-            activeCursor.set()                           // NEW
             return                                       // NEW
         }                                                // NEW
-        reassertCursor()
         guard pdfView?.document != nil else { return }
         let viewPoint = viewPoint(for: event)
         // Clicks on the selection's color bar recolor the selected strokes.
@@ -425,7 +424,6 @@ final class DrawingCanvasView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         if isPanning { pan(with: event); return }        // NEW
-        reassertCursor()
         let viewPoint = viewPoint(for: event)
         let effectiveTool = stylusIsEraserEnd ? .eraser : toolState.tool
 
@@ -456,12 +454,10 @@ final class DrawingCanvasView: NSView {
     override func mouseUp(with event: NSEvent) {
         if isPanning {                                   // NEW
             isPanning = false                            // NEW
-            reassertCursor()                             // NEW
             return                                       // NEW
         }
 
         if lassoDrag != nil { lassoEnded(); return }        // NEW
-        reassertCursor()
 
         defer {
             activeSamples = []
@@ -667,9 +663,7 @@ final class DrawingCanvasView: NSView {
     private func setSpaceHeld(_ held: Bool) {
         spaceHeld = held
         window?.invalidateCursorRects(for: self)
-        if let window, bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil)) {
-            activeCursor.set()
-        }
+        scheduleCursorRefresh()
     }
 
     private func pan(with event: NSEvent) {
@@ -742,7 +736,7 @@ final class DrawingCanvasView: NSView {
 
     private func lassoHit(_ p: CGPoint, page: PDFPage) -> LassoDrag? {
         guard let g = selectionGeometry(page: page) else { return nil }
-        let r: CGFloat = 11
+        let r = Self.handleHitRadius
         func near(_ a: CGPoint) -> Bool { hypot(a.x - p.x, a.y - p.y) <= r }
         if near(g.rotateHandle) { return .rotate(center: viewToPage(g.center, page: page)) }
         for i in 0..<4 where near(g.corners[i]) {
@@ -1083,11 +1077,42 @@ final class DrawingCanvasView: NSView {
 
     private var trackingArea: NSTrackingArea?
     private var cursorMonitor: Any?
+    private var cursorRefreshPending = false
 
-    /// Set now, and again after AppKit/PDFKit finish handling this event.
-    private func reassertCursor() {
-        activeCursor.set()
-        DispatchQueue.main.async { [weak self] in self?.activeCursor.set() }
+    /// Hit radius (view points) of the lasso's corner / rotate handles.
+    private static let handleHitRadius: CGFloat = 11
+
+    /// Asks for the cursor to be re-applied once, after the current event has
+    /// finished dispatching. Any number of calls within one run-loop turn
+    /// collapse into a single `set()`, so PDFView's own cursor changes can't
+    /// interleave with ours and cause flicker.
+    private func scheduleCursorRefresh() {
+        guard !cursorRefreshPending else { return }
+        cursorRefreshPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.cursorRefreshPending = false
+            self.applyCursor()
+        }
+    }
+
+    private func applyCursor() {
+        guard let window, window.isKeyWindow else { return }
+        let mouseInWindow = window.mouseLocationOutsideOfEventStream
+        let p = convert(mouseInWindow, from: nil)
+        let dragging = lassoDrag != nil || activePage != nil || isPanning
+        if !dragging {
+            guard bounds.contains(p) else { return }
+            // Don't claim the cursor over controls floating above the canvas
+            // (undo/redo pill, etc.).
+            if let content = window.contentView, let pdfView {
+                let inSuperview = content.superview?.convert(mouseInWindow, from: nil) ?? mouseInWindow
+                if let hit = content.hitTest(inSuperview), hit !== self, !hit.isDescendant(of: pdfView) {
+                    return
+                }
+            }
+        }
+        cursor(at: p).set()
     }
 
     /// Circle cursor: white outer ring + dark inner ring so it's visible on any background.
@@ -1108,7 +1133,67 @@ final class DrawingCanvasView: NSView {
         return NSCursor(image: image, hotSpot: NSPoint(x: size / 2, y: size / 2))
     }()
 
-    private var activeCursor: NSCursor {
+    /// Resize cursor: a "+" whose four arms each end in an arrowhead.
+    /// White halo under a black body so it reads on any background.
+    private static let resizeCursor: NSCursor = {
+        let size: CGFloat = 24
+        let image = NSImage(size: NSSize(width: size, height: size), flipped: false) { rect in
+            let c = CGPoint(x: rect.midX, y: rect.midY)
+            let reach: CGFloat = 10.5   // center → arrow tip
+            let head: CGFloat = 5       // arrowhead length
+            let half: CGFloat = 3.2     // arrowhead half-width
+            let directions: [(CGFloat, CGFloat)] = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+
+            let shape = NSBezierPath()
+            for (dx, dy) in directions {
+                let tip = CGPoint(x: c.x + dx * reach, y: c.y + dy * reach)
+                let base = CGPoint(x: c.x + dx * (reach - head), y: c.y + dy * (reach - head))
+                shape.move(to: c)                       // arm
+                shape.line(to: base)
+                shape.move(to: tip)                     // arrowhead
+                shape.line(to: CGPoint(x: base.x - dy * half, y: base.y + dx * half))
+                shape.line(to: CGPoint(x: base.x + dy * half, y: base.y - dx * half))
+                shape.close()
+            }
+            shape.lineJoinStyle = .miter
+
+            NSColor.white.withAlphaComponent(0.95).setStroke()
+            NSColor.white.withAlphaComponent(0.95).setFill()
+            shape.lineWidth = 3.2
+            shape.stroke()
+            shape.fill()
+
+            NSColor.black.setStroke()
+            NSColor.black.setFill()
+            shape.lineWidth = 1.2
+            shape.stroke()
+            shape.fill()
+            return true
+        }
+        return NSCursor(image: image, hotSpot: NSPoint(x: size / 2, y: size / 2))
+    }()
+
+    /// True when `p` (view space) is over one of the selection's corner scale handles.
+    private func isOverScaleHandle(_ p: CGPoint) -> Bool {
+        guard selectionPageIndex >= 0,
+              let page = pdfView?.document?.page(at: selectionPageIndex),
+              let g = selectionGeometry(page: page) else { return false }
+        return g.corners.contains { hypot($0.x - p.x, $0.y - p.y) <= Self.handleHitRadius }
+    }
+
+    /// Cursor for the current tool/state, and for `p` when hovering a handle.
+    private func cursor(at p: CGPoint) -> NSCursor {
+        if spaceHeld { return isPanning ? .closedHand : .openHand }
+        if toolState.isTextSelectionEnabled { return .iBeam }
+        if let drag = lassoDrag, case .scale = drag { return Self.resizeCursor }   // stays while resizing
+        if lassoDrag == nil, !stylusIsEraserEnd, toolState.tool == .lasso, isOverScaleHandle(p) {
+            return Self.resizeCursor
+        }
+        return baseCursor
+    }
+
+    /// Position-independent cursor for the current tool (used for the cursor rect).
+    private var baseCursor: NSCursor {
         if spaceHeld { return isPanning ? .closedHand : .openHand }
         if toolState.isTextSelectionEnabled { return .iBeam }
         return toolState.tool == .eraser ? .disappearingItem : Self.circleCursor
@@ -1125,11 +1210,13 @@ final class DrawingCanvasView: NSView {
         trackingArea = area
     }
 
+    // The cursor rect keeps PDFView's own cursor rects (I-beam over text, etc.)
+    // from winning underneath us; the precise cursor is applied by applyCursor().
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: activeCursor)
+        addCursorRect(bounds, cursor: baseCursor)
     }
 
-    override func cursorUpdate(with event: NSEvent) { activeCursor.set() }
-    override func mouseMoved(with event: NSEvent)   { activeCursor.set() }
-    override func mouseEntered(with event: NSEvent) { activeCursor.set() }
+    override func cursorUpdate(with event: NSEvent) { scheduleCursorRefresh() }
+    override func mouseMoved(with event: NSEvent)   { scheduleCursorRefresh() }
+    override func mouseEntered(with event: NSEvent) { scheduleCursorRefresh() }
 }
